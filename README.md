@@ -9,6 +9,7 @@
 - 从原始起点或检查点重载关卡，并屏蔽真实触摸后注入记录的判定
 - 第三方谱面之间使用 `scnGame.LoadAndPlayLevel` 原地热重载；从主岛进入时调用游戏原生 `scrController.LoadCustomLevel`，由游戏安全建立 IL2CPP 自定义谱面路径数组
 - 通过控制器状态检测谱面转场，不占用 `scrController.StartLoadingScene` Hook，可与 ShowBPM 同时启用
+- 使用新版 StArray.ModManager 的 `[UnmanagedHook]` Source Generator 安装和卸载游戏 Hook，不再手工维护 Dobby trampoline
 - 开始岛显示 ImGui 回放入口，可打开独立全屏回放管理器；游戏、设置和其他场景中自动隐藏
 - 回放管理器支持搜索、分页、进度与来源详情、播放和删除确认
 - 回放时在左下角提供暂停/继续和中止按钮；失败或通关后恢复原版结算并自动释放输入锁
@@ -24,7 +25,7 @@ PC 自定义关卡回放通常保存的是电脑路径。把对应关卡放到�
 
 需要 .NET 10 SDK：
 
-1. 从 `StArray.ModManager 1.0.4+` 获取 `StArray.ModManager.dll` 和 `ImGui.NET.dll`。
+1. 从新版 StArray.ModManager 获取 `StArray.ModManager.dll`、`StArray.ModManager.Analyzer.dll` 和 `ImGui.NET.dll`。
 2. 从 .NET 10 SDK 获取 `System.Formats.Nrbf.dll`。
 3. 将三个引用文件放入 `References` 目录。
 

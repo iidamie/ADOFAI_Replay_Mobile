@@ -70,7 +70,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
 
     public string Id => "Replay";
     public string Name => "ADOFAI Replay";
-    public string Version => "1.4.2-mobile.13";
+    public string Version => "1.4.2-mobile.14";
     public string Author => "Flower / ADOFAI.gg";
     public string Description => "Record and replay ADOFAI mobile runs with IL2CPP-native hooks";
     public IReadOnlyList<string> Dependencies => Array.Empty<string>();
