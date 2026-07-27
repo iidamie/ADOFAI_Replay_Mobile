@@ -70,7 +70,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
 
     public string Id => "Replay";
     public string Name => "ADOFAI Replay";
-    public string Version => "1.4.2-mobile.14";
+    public string Version => "1.4.2-mobile.15";
     public string Author => "Flower / ADOFAI.gg";
     public string Description => "Record and replay ADOFAI mobile runs with IL2CPP-native hooks";
     public IReadOnlyList<string> Dependencies => Array.Empty<string>();
@@ -1055,8 +1055,15 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
         Vector2 display = io.DisplaySize;
         if (display.X < 200f || display.Y < 120f)
             return;
-        Vector2 size = new(Math.Min(180f, display.X * 0.42f), 58f);
-        ImGui.SetNextWindowPos(new Vector2(display.X - size.X - 18f, display.Y - size.Y - 24f), ImGuiCond.Always);
+        ImGuiStylePtr style = ImGui.GetStyle();
+        float margin = GetOverlayMargin();
+        float buttonHeight = GetOverlayButtonHeight();
+        float desiredWidth = ImGui.CalcTextSize(ui.IslandEntry).X
+            + style.FramePadding.X * 2f
+            + style.WindowPadding.X * 2f;
+        float width = ClampOverlayWidth(display.X, margin, 180f, desiredWidth);
+        Vector2 size = new(width, GetOverlayWindowHeight(buttonHeight));
+        ImGui.SetNextWindowPos(new Vector2(display.X - size.X - margin, display.Y - size.Y - margin), ImGuiCond.Always);
         ImGui.SetNextWindowSize(size, ImGuiCond.Always);
         ImGui.SetNextWindowBgAlpha(0.88f);
         ImGuiWindowFlags flags = ImGuiWindowFlags.NoTitleBar
@@ -1066,7 +1073,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             | ImGuiWindowFlags.NoScrollbar;
         if (ImGui.Begin("##ReplayMainEntry", flags))
         {
-            if (ImGui.Button(ui.IslandEntry, new Vector2(-1f, 38f)))
+            if (ImGui.Button(ui.IslandEntry, new Vector2(-1f, buttonHeight)))
                 OpenReplayManager();
         }
         ImGui.End();
@@ -1079,7 +1086,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
 
     private void DrawReplayControls()
     {
-        if (_managerOpen || !_showReplayHud)
+        if (_managerOpen)
             return;
         ReplayData? replay;
         ReplayRunState state;
@@ -1095,8 +1102,22 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
         if (display.X < 260f || display.Y < 120f)
             return;
         UiText ui = UiText.FromLanguage(_languageCode);
-        Vector2 size = new(Math.Min(250f, display.X * 0.62f), 58f);
-        ImGui.SetNextWindowPos(new Vector2(18f, display.Y - size.Y - 20f), ImGuiCond.Always);
+        ImGuiStylePtr style = ImGui.GetStyle();
+        float margin = GetOverlayMargin();
+        float buttonHeight = GetOverlayButtonHeight();
+        string primaryLabel = state == ReplayRunState.Paused ? ui.Resume : ui.Pause;
+        float desiredWidth = state is ReplayRunState.Playing or ReplayRunState.Paused
+            ? ImGui.CalcTextSize(primaryLabel).X
+                + ImGui.CalcTextSize(ui.Stop).X
+                + style.FramePadding.X * 4f
+                + style.ItemSpacing.X
+                + style.WindowPadding.X * 2f
+            : ImGui.CalcTextSize(ui.Stop).X
+                + style.FramePadding.X * 2f
+                + style.WindowPadding.X * 2f;
+        float width = ClampOverlayWidth(display.X, margin, 250f, desiredWidth);
+        Vector2 size = new(width, GetOverlayWindowHeight(buttonHeight));
+        ImGui.SetNextWindowPos(new Vector2(margin, display.Y - size.Y - margin), ImGuiCond.Always);
         ImGui.SetNextWindowSize(size, ImGuiCond.Always);
         ImGui.SetNextWindowBgAlpha(0.9f);
         ImGuiWindowFlags flags = ImGuiWindowFlags.NoTitleBar
@@ -1111,13 +1132,13 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
                 float buttonWidth = Math.Max(
                     70f,
                     (ImGui.GetContentRegionAvail().X - ImGui.GetStyle().ItemSpacing.X) * 0.5f);
-                if (ImGui.Button(state == ReplayRunState.Paused ? ui.Resume : ui.Pause, new Vector2(buttonWidth, 38f)))
+                if (ImGui.Button(primaryLabel, new Vector2(buttonWidth, buttonHeight)))
                     _commands.Enqueue(new ReplayCommand(ReplayCommandKind.TogglePause));
                 ImGui.SameLine();
-                if (ImGui.Button(ui.Stop, new Vector2(buttonWidth, 38f)))
+                if (ImGui.Button(ui.Stop, new Vector2(buttonWidth, buttonHeight)))
                     _commands.Enqueue(new ReplayCommand(ReplayCommandKind.Stop));
             }
-            else if (ImGui.Button(ui.Stop, new Vector2(-1f, 38f)))
+            else if (ImGui.Button(ui.Stop, new Vector2(-1f, buttonHeight)))
                 _commands.Enqueue(new ReplayCommand(ReplayCommandKind.Stop));
         }
         ImGui.End();
@@ -1128,8 +1149,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
         if (_managerOpen)
             return;
         long settingsAge = Environment.TickCount64 - Interlocked.Read(ref _lastSettingsGuiTick);
-        ImGuiIOPtr io = ImGui.GetIO();
-        if (settingsAge < 250 || io.WantTextInput)
+        if (settingsAge < 250)
             return;
 
         bool visible;
@@ -1151,8 +1171,16 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
         if (display.X < 220f || display.Y < 120f)
             return;
         UiText ui = UiText.FromLanguage(_languageCode);
-        Vector2 size = new(Math.Min(220f, display.X * 0.55f), 58f);
-        ImGui.SetNextWindowPos(new Vector2(18f, display.Y - size.Y - 20f), ImGuiCond.Always);
+        ImGuiStylePtr style = ImGui.GetStyle();
+        float margin = GetOverlayMargin();
+        float buttonHeight = GetOverlayButtonHeight();
+        string label = saved ? ui.ResultSaved : queued ? ui.SavingResult : ui.SaveResult;
+        float desiredWidth = ImGui.CalcTextSize(label).X
+            + style.FramePadding.X * 2f
+            + style.WindowPadding.X * 2f;
+        float width = ClampOverlayWidth(display.X, margin, 220f, desiredWidth);
+        Vector2 size = new(width, GetOverlayWindowHeight(buttonHeight));
+        ImGui.SetNextWindowPos(new Vector2(margin, display.Y - size.Y - margin), ImGuiCond.Always);
         ImGui.SetNextWindowSize(size, ImGuiCond.Always);
         ImGui.SetNextWindowBgAlpha(0.9f);
         ImGuiWindowFlags flags = ImGuiWindowFlags.NoTitleBar
@@ -1162,8 +1190,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             | ImGuiWindowFlags.NoScrollbar;
         if (ImGui.Begin("##ReplayResultSave", flags))
         {
-            string label = saved ? ui.ResultSaved : queued ? ui.SavingResult : ui.SaveResult;
-            if (ImGui.Button(label, new Vector2(-1f, 38f)) && !saved && !queued)
+            if (ImGui.Button(label, new Vector2(-1f, buttonHeight)) && !saved && !queued)
             {
                 lock (_stateLock)
                     _resultSaveQueued = true;
@@ -1194,8 +1221,14 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
         Vector2 display = ImGui.GetIO().DisplaySize;
         if (display.X < 180f || display.Y < 100f)
             return;
-        Vector2 size = new(Math.Min(420f, display.X - 32f), 64f);
-        ImGui.SetNextWindowPos(new Vector2((display.X - size.X) * 0.5f, 20f), ImGuiCond.Always);
+        ImGuiStylePtr style = ImGui.GetStyle();
+        float margin = GetOverlayMargin();
+        float desiredWidth = ImGui.CalcTextSize(toast).X + style.WindowPadding.X * 2f;
+        float width = ClampOverlayWidth(display.X, margin, 420f, desiredWidth);
+        float wrapWidth = Math.Max(1f, width - style.WindowPadding.X * 2f);
+        float textHeight = ImGui.CalcTextSize(toast, false, wrapWidth).Y;
+        Vector2 size = new(width, Math.Max(64f, textHeight + style.WindowPadding.Y * 2f));
+        ImGui.SetNextWindowPos(new Vector2((display.X - size.X) * 0.5f, margin), ImGuiCond.Always);
         ImGui.SetNextWindowSize(size, ImGuiCond.Always);
         ImGui.SetNextWindowBgAlpha(0.94f);
         ImGuiWindowFlags flags = ImGuiWindowFlags.NoTitleBar
@@ -1207,6 +1240,27 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
         if (ImGui.Begin("##ReplayToast", flags))
             ImGui.TextWrapped(toast);
         ImGui.End();
+    }
+
+    private static float GetOverlayMargin()
+    {
+        return Math.Max(18f, ImGui.GetFontSize() * 0.65f);
+    }
+
+    private static float GetOverlayButtonHeight()
+    {
+        return Math.Max(38f, ImGui.GetFrameHeight() * 1.2f);
+    }
+
+    private static float GetOverlayWindowHeight(float buttonHeight)
+    {
+        return buttonHeight + ImGui.GetStyle().WindowPadding.Y * 2f;
+    }
+
+    private static float ClampOverlayWidth(float displayWidth, float margin, float minimum, float desired)
+    {
+        float available = Math.Max(1f, displayWidth - margin * 2f);
+        return Math.Min(available, Math.Max(Math.Min(minimum, available), desired));
     }
 
     private void DrawReplayManager()
