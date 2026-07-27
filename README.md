@@ -36,6 +36,16 @@ python3 package_mod.py
 
 最终 Mod 只携带 `Replay.dll` 和用于安全读取旧 PC 回放的 `System.Formats.Nrbf.dll`。公共的 `StArray.ModManager.dll` 与 `ImGui.NET.dll` 由加载器提供。
 
+## 自动构建
+
+推送 `MobilePlugin`、`VERSION.txt`、打包脚本或 Release Workflow 的变更到 `main` 后，GitHub Actions 会自动：
+
+1. 构建固定版本的 StArray.ModManager 与 Hook Analyzer。
+2. 编译 Replay 并运行 `package_mod.py`。
+3. 校验 Zip、保存 Actions Artifact，并发布到 `v{VERSION.txt}` Release。
+
+同一版本标签不会被移动到其他提交。修改代码并发布新包前必须先提升 `VERSION.txt`，以保证 Release 标签、源码和二进制一致。
+
 ## 安装结构
 
 将 Zip 解压到手机 ModManager 的 `mods` 目录：

@@ -1,0 +1,131 @@
+name: Build and release mod
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "MobilePlugin/**"
+      - "VERSION.txt"
+      - "package_mod.py"
+      - ".github/workflows/release.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: replay-release-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  MOD_MANAGER_REF: 2719a697dd43deb712f1bdd30a477fefa90a6a25
+
+jobs:
+  build-release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Replay
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Checkout StArray.ModManager
+        uses: actions/checkout@v4
+        with:
+          repository: StArraySharp/StArray.ModManager
+          ref: ${{ env.MOD_MANAGER_REF }}
+          path: dependencies/StArray.ModManager
+
+      - name: Build StArray.ModManager references
+        run: >-
+          dotnet build
+          dependencies/StArray.ModManager/StArray.ModManager/StArray.ModManager.csproj
+          --configuration Release
+
+      - name: Prepare build references
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          manager_root="dependencies/StArray.ModManager"
+          manager_output="$manager_root/StArray.ModManager/bin/Release/net10.0"
+          analyzer_output="$manager_root/StArray.ModManager.Analyzer/bin/Release/netstandard2.0"
+          imgui_dll="$(find "$HOME/.nuget/packages/imgui.net" -path '*/lib/net8.0/ImGui.NET.dll' -type f | sort -V | tail -n 1)"
+          nrbf_dll="$(find "$DOTNET_ROOT/sdk" -mindepth 2 -maxdepth 2 -name 'System.Formats.Nrbf.dll' -type f | sort -V | tail -n 1)"
+
+          test -f "$manager_output/StArray.ModManager.dll"
+          test -f "$analyzer_output/StArray.ModManager.Analyzer.dll"
+          test -f "$imgui_dll"
+          test -f "$nrbf_dll"
+
+          cp "$manager_output/StArray.ModManager.dll" References/StArray.ModManager.dll
+          cp "$analyzer_output/StArray.ModManager.Analyzer.dll" References/StArray.ModManager.Analyzer.dll
+          cp "$imgui_dll" References/ImGui.NET.dll
+          cp "$nrbf_dll" References/System.Formats.Nrbf.dll
+
+      - name: Build Replay
+        run: dotnet build MobilePlugin/Replay.csproj --configuration Release
+
+      - name: Package mod
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version="$(tr -d '\r\n' < VERSION.txt)"
+          test -n "$version"
+          python3 package_mod.py MobilePlugin/bin/Release/net10.0
+          zip_path="Replay-$version.zip"
+          test -f "$zip_path"
+          unzip -t "$zip_path"
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+          echo "zip_path=$zip_path" >> "$GITHUB_OUTPUT"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Replay-${{ steps.package.outputs.version }}
+          path: ${{ steps.package.outputs.zip_path }}
+          if-no-files-found: error
+
+      - name: Create GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ steps.package.outputs.tag }}
+          RELEASE_VERSION: ${{ steps.package.outputs.version }}
+          RELEASE_ZIP: ${{ steps.package.outputs.zip_path }}
+        run: |
+          set -euo pipefail
+
+          git fetch --tags --force
+          if tag_commit="$(git rev-list -n 1 "$RELEASE_TAG" 2>/dev/null)"; then
+            if [[ "$tag_commit" != "$GITHUB_SHA" ]]; then
+              echo "::error::Tag $RELEASE_TAG already points to $tag_commit. Bump VERSION.txt before publishing another build."
+              exit 1
+            fi
+          fi
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "$RELEASE_ZIP" --clobber
+          elif git rev-parse --verify --quiet "refs/tags/$RELEASE_TAG" >/dev/null; then
+            gh release create "$RELEASE_TAG" "$RELEASE_ZIP" \
+              --verify-tag \
+              --title "ADOFAI Replay Mobile $RELEASE_VERSION" \
+              --generate-notes
+          else
+            gh release create "$RELEASE_TAG" "$RELEASE_ZIP" \
+              --target "$GITHUB_SHA" \
+              --title "ADOFAI Replay Mobile $RELEASE_VERSION" \
+              --generate-notes
+          fi
