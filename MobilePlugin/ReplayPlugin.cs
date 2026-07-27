@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Numerics;
 using System.Reflection;
+using System.Text;
 using ImGuiNET;
 using StArray.ModManager.Manager;
 using StArray.ModManager.Runtime;
@@ -12,7 +13,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
     private const string LogTag = "Replay";
     private const int PlayerControlState = 4;
     private const int StableIdentityTicksRequired = 20;
-    private const int ManagerPageSize = 12;
+    private static readonly TimeSpan CustomLevelBrowserTimeout = TimeSpan.FromSeconds(60);
 
     private readonly object _stateLock = new();
     private readonly ConcurrentQueue<ReplayCommand> _commands = new();
@@ -38,23 +39,26 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
     private ReplayLevelIdentity? _pendingIdentity;
     private string _lastScannedDirectory = "";
     private string _selectedReplayPath = "";
+    private string _editingReplayPath = "";
+    private string _replayTitleEdit = "";
     private string _fileSearch = "";
     private string _pendingDeletePath = "";
     private bool _recording;
     private bool _levelTransitionInProgress;
     private bool _renderErrorLogged;
     private bool _managerOpen;
+    private bool _managerShowingDetails;
     private bool _managerPausedGame;
     private bool _resultAttemptSaved;
     private bool _resultSaveQueued;
     private bool _deletePopupRequested;
     private bool _islandEntryLogged;
     private long _lastSettingsGuiTick;
-    private int _filePage;
     private string _notice = "";
     private DateTime _noticeUntilUtc;
     private string _toast = "";
     private DateTime _toastUntilUtc;
+    private DateTime _loadDeadlineUtc;
 
     private bool _saveFullClear = true;
     private bool _saveEveryCompletion;
@@ -70,7 +74,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
 
     public string Id => "Replay";
     public string Name => "ADOFAI Replay";
-    public string Version => "1.4.2-mobile.16";
+    public string Version => "1.4.2-mobile.25";
     public string Author => "Flower / ADOFAI.gg";
     public string Description => "Record and replay ADOFAI mobile runs with IL2CPP-native hooks";
     public IReadOnlyList<string> Dependencies => Array.Empty<string>();
@@ -81,6 +85,25 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
         {
             lock (_stateLock)
                 return _activeReplay != null;
+        }
+    }
+
+    internal bool IsReplayLoadPending
+    {
+        get
+        {
+            lock (_stateLock)
+                return _pendingReplay != null;
+        }
+    }
+
+    internal bool IsReplayTargetStartPending
+    {
+        get
+        {
+            lock (_stateLock)
+                return _pendingReplay != null
+                    && _loadStage == ReplayLoadStage.WaitingForTargetStart;
         }
     }
 
@@ -103,6 +126,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             _game = null;
             throw new InvalidOperationException("Required Replay IL2CPP hooks could not be installed");
         }
+        CustomLoadDiagnostics.Install(this);
 
         RefreshFiles();
         nint controller = _game.GetController();
@@ -122,6 +146,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
         catch
         {
         }
+        CustomLoadDiagnostics.Uninstall();
         GameHooks.Uninstall();
         lock (_stateLock)
         {
@@ -139,6 +164,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             _levelTransitionInProgress = false;
             _runState = ReplayRunState.Idle;
             _loadStage = ReplayLoadStage.None;
+            _loadDeadlineUtc = default;
             _resultAttemptSaved = false;
             _resultSaveQueued = false;
             _toast = "";
@@ -341,45 +367,51 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
 
     internal void HandleStartRewind(nint controller, int sequenceId)
     {
-        GameApi? game = _game;
-        if (game == null)
+        if (_game == null)
             return;
 
         _controller = controller;
-        _player = game.GetPlayer(controller);
-        _languageCode = game.GetLanguageCode();
         _levelTransitionInProgress = false;
+        bool activated = false;
+        bool restarted = false;
 
         lock (_stateLock)
         {
-            if (_pendingReplay != null)
+            if (_pendingReplay != null
+                && _loadStage == ReplayLoadStage.WaitingForTargetStart)
             {
                 _activeReplay = _pendingReplay;
                 _pendingReplay = null;
                 _loadStage = ReplayLoadStage.None;
+                _loadDeadlineUtc = default;
                 _replayIndex = 0;
                 _recording = false;
                 _runState = ReplayRunState.WaitingForStart;
-                game.SetPaused(controller, false);
-                Logger.Info(LogTag, "Replay activated after level load");
-                return;
+                activated = true;
             }
-
-            if (_activeReplay != null && _runState is not ReplayRunState.Finished and not ReplayRunState.Failed)
+            else if (_activeReplay != null
+                && _runState is not ReplayRunState.Finished and not ReplayRunState.Failed)
             {
                 _replayIndex = 0;
                 _recording = false;
                 _runState = ReplayRunState.WaitingForStart;
-                game.SetPaused(controller, false);
-                return;
+                restarted = true;
             }
-
-            if (_runState is ReplayRunState.Finished or ReplayRunState.Failed)
+            else if (_runState is ReplayRunState.Finished or ReplayRunState.Failed)
             {
                 _activeReplay = null;
                 _runState = ReplayRunState.Idle;
             }
         }
+
+        if (activated)
+        {
+            _game?.CancelPendingCustomReplayLoad();
+            Logger.Info(LogTag, "Replay activated after level load");
+            return;
+        }
+        if (restarted)
+            return;
 
         QueueAttemptStart(controller, sequenceId);
     }
@@ -429,9 +461,74 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
                 case ReplayCommandKind.TogglePause:
                     TogglePauseNow();
                     break;
+                case ReplayCommandKind.PauseForManager:
+                    PauseForReplayManagerNow();
+                    break;
+                case ReplayCommandKind.ResumeAfterManager:
+                    ResumeAfterReplayManagerNow();
+                    break;
             }
         }
+        AdvancePendingReplayLoad();
         EnsureAttemptStarted(controller);
+    }
+
+    private void AdvancePendingReplayLoad()
+    {
+        GameApi? game = _game;
+        ReplayData? replay;
+        DateTime deadline;
+        lock (_stateLock)
+        {
+            if (_loadStage != ReplayLoadStage.WaitingForCustomLevelBrowser
+                || _pendingReplay == null)
+                return;
+            replay = _pendingReplay;
+            deadline = _loadDeadlineUtc;
+        }
+
+        if (deadline != default && DateTime.UtcNow >= deadline)
+        {
+            FailPendingReplayLoad("等待游戏扫描自定义关卡列表超时，请确认谱面仍位于游戏的 Levels 目录中。");
+            return;
+        }
+
+        CustomReplayLoadStatus status = game?.AdvanceCustomReplayLoad(replay)
+            ?? CustomReplayLoadStatus.Failed;
+        if (status == CustomReplayLoadStatus.Waiting)
+            return;
+        if (status == CustomReplayLoadStatus.Failed)
+        {
+            string error = string.IsNullOrWhiteSpace(game?.LastLoadError)
+                ? UiText.FromLanguage(_languageCode).LoadFailed
+                : game!.LastLoadError;
+            FailPendingReplayLoad(error);
+            return;
+        }
+
+        lock (_stateLock)
+        {
+            if (!ReferenceEquals(_pendingReplay, replay))
+                return;
+            _loadStage = ReplayLoadStage.WaitingForTargetStart;
+            _loadDeadlineUtc = default;
+        }
+        Logger.Info(LogTag, $"Replay custom level opened via {game?.LastLoadRoute}: {game?.GetReplayLoadState()}");
+    }
+
+    private void FailPendingReplayLoad(string error)
+    {
+        _game?.CancelPendingCustomReplayLoad();
+        lock (_stateLock)
+        {
+            _activeReplay = null;
+            _pendingReplay = null;
+            _runState = ReplayRunState.Idle;
+            _loadStage = ReplayLoadStage.None;
+            _loadDeadlineUtc = default;
+        }
+        SetNotice(error);
+        Logger.Error(LogTag, $"Could not load replay level: {error}");
     }
 
     private void DetectLevelTransition(nint controller)
@@ -866,6 +963,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             _currentAttempt = null;
             _runState = ReplayRunState.Loading;
             _loadStage = ReplayLoadStage.WaitingForTargetStart;
+            _loadDeadlineUtc = DateTime.UtcNow.Add(CustomLevelBrowserTimeout);
             _replayIndex = 0;
             _recording = false;
         }
@@ -883,6 +981,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
                 _pendingReplay = null;
                 _runState = ReplayRunState.Idle;
                 _loadStage = ReplayLoadStage.None;
+                _loadDeadlineUtc = default;
             }
             string error = string.IsNullOrWhiteSpace(game.LastLoadError)
                 ? UiText.FromLanguage(_languageCode).LoadFailed
@@ -890,6 +989,13 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             SetNotice(error);
             Logger.Error(LogTag, $"Could not load replay level: {replay.SongName}: {error}");
             return;
+        }
+        lock (_stateLock)
+        {
+            if (ReferenceEquals(_pendingReplay, pendingReplay))
+                _loadStage = game.WaitingForCustomLevelBrowser
+                    ? ReplayLoadStage.WaitingForCustomLevelBrowser
+                    : ReplayLoadStage.WaitingForTargetStart;
         }
         Logger.Info(LogTag, $"Replay load requested via {game.LastLoadRoute}: {game.GetReplayLoadState()}");
     }
@@ -918,6 +1024,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
     private void StopPlaybackNow(bool resumeRecording = true)
     {
         GameApi? game = _game;
+        game?.CancelPendingCustomReplayLoad();
         nint controller = game?.GetController() ?? 0;
         if (controller != 0)
             game?.SetPaused(controller, false);
@@ -928,6 +1035,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             _replayIndex = 0;
             _runState = ReplayRunState.Idle;
             _loadStage = ReplayLoadStage.None;
+            _loadDeadlineUtc = default;
         }
         if (resumeRecording && game?.IsGameWorld(controller) == true)
             QueueAttemptStart(controller, game.GetCurrentSequence(controller));
@@ -957,16 +1065,16 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
 
     private void OpenReplayManager()
     {
-        GameApi? game = _game;
-        nint controller = game?.GetController() ?? 0;
-        bool pauseGame = game?.IsGameWorld(controller) == true && game.IsPaused(controller) == false;
-        if (pauseGame)
-            game?.SetPaused(controller, true);
+        bool shouldPause;
         lock (_stateLock)
         {
+            shouldPause = !_managerOpen;
             _managerOpen = true;
-            _managerPausedGame = pauseGame;
+            if (shouldPause)
+                _managerPausedGame = false;
         }
+        if (shouldPause)
+            _commands.Enqueue(new ReplayCommand(ReplayCommandKind.PauseForManager));
         RefreshFiles();
     }
 
@@ -977,28 +1085,59 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
         {
             resume = _managerPausedGame;
             _managerOpen = false;
+            _managerShowingDetails = false;
             _managerPausedGame = false;
             _pendingDeletePath = "";
             _deletePopupRequested = false;
+            _editingReplayPath = "";
+            _replayTitleEdit = "";
         }
         if (resume)
+            _commands.Enqueue(new ReplayCommand(ReplayCommandKind.ResumeAfterManager));
+    }
+
+    private void PauseForReplayManagerNow()
+    {
+        GameApi? game = _game;
+        nint controller = game?.GetController() ?? 0;
+        lock (_stateLock)
         {
-            GameApi? game = _game;
-            nint controller = game?.GetController() ?? 0;
-            if (controller != 0)
-                game?.SetPaused(controller, false);
+            if (!_managerOpen)
+                return;
         }
+        if (controller == 0 || game?.IsGameWorld(controller) != true || game.IsPaused(controller))
+            return;
+
+        game.SetPaused(controller, true);
+        lock (_stateLock)
+        {
+            if (_managerOpen)
+            {
+                _managerPausedGame = true;
+                return;
+            }
+        }
+        game.SetPaused(controller, false);
+    }
+
+    private void ResumeAfterReplayManagerNow()
+    {
+        GameApi? game = _game;
+        nint controller = game?.GetController() ?? 0;
+        if (controller != 0)
+            game?.SetPaused(controller, false);
     }
 
     private void DrawIslandEntry()
     {
         GameApi? game = _game;
-        bool levelSelect = game?.IsLevelSelect() == true;
-        if (!levelSelect)
+        bool customLevelSelect = game?.IsCustomLevelSelect() == true;
+        bool entryScene = customLevelSelect || game?.IsLevelSelect() == true;
+        if (!entryScene)
             _islandEntryLogged = false;
         long settingsAge = Environment.TickCount64 - Interlocked.Read(ref _lastSettingsGuiTick);
         ImGuiIOPtr io = ImGui.GetIO();
-        if (!levelSelect || game == null || _managerOpen || settingsAge < 250 || io.WantTextInput)
+        if (!entryScene || game == null || _managerOpen || settingsAge < 250 || io.WantTextInput)
             return;
 
         UiText ui = UiText.FromLanguage(_languageCode);
@@ -1030,7 +1169,11 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
         if (!_islandEntryLogged)
         {
             _islandEntryLogged = true;
-            Logger.Info(LogTag, "Replay main-page entry is available");
+            Logger.Info(
+                LogTag,
+                customLevelSelect
+                    ? "Replay custom-level-page entry is available"
+                    : "Replay main-page entry is available");
         }
     }
 
@@ -1222,6 +1365,19 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
         Vector2 display = ImGui.GetIO().DisplaySize;
         if (display.X <= 0f || display.Y <= 0f)
             return;
+
+        ImGuiStylePtr baseStyle = ImGui.GetStyle();
+        ImGui.PushStyleVar(
+            ImGuiStyleVar.WindowPadding,
+            new Vector2(Math.Max(baseStyle.WindowPadding.X, 18f), Math.Max(baseStyle.WindowPadding.Y, 14f)));
+        ImGui.PushStyleVar(
+            ImGuiStyleVar.FramePadding,
+            new Vector2(Math.Max(baseStyle.FramePadding.X, 14f), Math.Max(baseStyle.FramePadding.Y, 9f)));
+        ImGui.PushStyleVar(
+            ImGuiStyleVar.ItemSpacing,
+            new Vector2(Math.Max(baseStyle.ItemSpacing.X, 12f), Math.Max(baseStyle.ItemSpacing.Y, 10f)));
+        ImGui.PushStyleVar(ImGuiStyleVar.FrameRounding, Math.Max(baseStyle.FrameRounding, 6f));
+        ImGui.PushStyleVar(ImGuiStyleVar.SelectableTextAlign, new Vector2(0f, 0.5f));
         ImGui.SetNextWindowPos(Vector2.Zero, ImGuiCond.Always);
         ImGui.SetNextWindowSize(display, ImGuiCond.Always);
         ImGui.SetNextWindowBgAlpha(0.97f);
@@ -1232,110 +1388,206 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             | ImGuiWindowFlags.NoSavedSettings;
         if (ImGui.Begin($"{ui.ManagerTitle}###ReplayManager", ref open, flags))
         {
-            if (ImGui.Button(ui.Refresh))
-                RefreshFiles();
-            ImGui.SameLine();
-            if (ImGui.Button(ui.SaveCurrent))
-                QueueSaveCurrent(ui);
-            ImGui.SameLine();
-            if (ImGui.Button(ui.Close))
-                open = false;
-
-            ImGui.Separator();
-            ImGui.SetNextItemWidth(-1f);
-            if (ImGui.InputText($"{ui.Search}##replay-search", ref _fileSearch, 128))
-                _filePage = 0;
-
+            ImGui.SetWindowFontScale(1.06f);
             List<ReplayFileEntry> files;
             lock (_stateLock)
                 files = _files.ToList();
-            string search = _fileSearch.Trim();
-            if (!string.IsNullOrEmpty(search))
+            ReplayFileEntry? selected = files.FirstOrDefault(entry =>
+                string.Equals(entry.Path, _selectedReplayPath, StringComparison.Ordinal));
+            if (_managerShowingDetails && selected != null)
             {
-                files = files.Where(entry =>
-                        entry.SongName.Contains(search, StringComparison.OrdinalIgnoreCase)
-                        || entry.ArtistName.Contains(search, StringComparison.OrdinalIgnoreCase))
-                    .ToList();
-            }
-
-            int pageCount = Math.Max(1, (files.Count + ManagerPageSize - 1) / ManagerPageSize);
-            _filePage = Math.Clamp(_filePage, 0, pageCount - 1);
-            ImGui.TextUnformatted($"{ui.Files}: {files.Count}    {ui.Page} {_filePage + 1}/{pageCount}");
-            if (_filePage > 0 && ImGui.Button(ui.Previous))
-                _filePage--;
-            if (_filePage + 1 < pageCount)
-            {
-                if (_filePage > 0)
-                    ImGui.SameLine();
-                if (ImGui.Button(ui.Next))
-                    _filePage++;
-            }
-
-            ImGui.Separator();
-            if (files.Count == 0)
-            {
-                ImGui.TextDisabled(ui.NoFiles);
+                DrawReplayDetailsPage(ui, selected, ref open);
             }
             else
             {
-                int start = _filePage * ManagerPageSize;
-                int end = Math.Min(start + ManagerPageSize, files.Count);
-                for (int index = start; index < end; index++)
-                {
-                    ReplayFileEntry entry = files[index];
-                    string result = entry.Supported
-                        ? entry.Completed ? ui.Complete : ui.Failed
-                        : ui.Unsupported;
-                    int progress = GetEndProgress(entry);
-                    string label = $"{entry.RecordedAtUtc.ToLocalTime():MM-dd HH:mm}  [{result} {progress}%]  "
-                        + $"{entry.SongName}##replay-{entry.Path}";
-                    if (ImGui.Selectable(label, string.Equals(_selectedReplayPath, entry.Path, StringComparison.Ordinal)))
-                    {
-                        _selectedReplayPath = entry.Path;
-                        _pendingDeletePath = "";
-                    }
-                }
+                _managerShowingDetails = false;
+                DrawReplayListPage(ui, files, ref open);
             }
-
-            ReplayFileEntry? selected = files.FirstOrDefault(entry =>
-                string.Equals(entry.Path, _selectedReplayPath, StringComparison.Ordinal));
-            if (selected != null)
-            {
-                ImGui.Separator();
-                DrawReplayDetails(ui, selected);
-            }
-            ShowNotice();
         }
         ImGui.End();
+        ImGui.PopStyleVar(5);
         if (!open)
             CloseReplayManager();
     }
 
+    private void DrawReplayListPage(UiText ui, List<ReplayFileEntry> files, ref bool open)
+    {
+        ImGuiStylePtr style = ImGui.GetStyle();
+        float buttonHeight = GetManagerButtonHeight();
+        float availableWidth = ImGui.GetContentRegionAvail().X;
+        bool toolbarOnOneLine = CanFitManagerButtonRow(
+            availableWidth,
+            ui.Refresh,
+            ui.SaveCurrent,
+            ui.Close);
+        float toolbarButtonWidth = toolbarOnOneLine
+            ? Math.Max(1f, (availableWidth - style.ItemSpacing.X * 2f) / 3f)
+            : -1f;
+
+        if (ImGui.Button(ui.Refresh, new Vector2(toolbarButtonWidth, buttonHeight)))
+            RefreshFiles();
+        if (toolbarOnOneLine)
+            ImGui.SameLine();
+        if (ImGui.Button(ui.SaveCurrent, new Vector2(toolbarButtonWidth, buttonHeight)))
+            QueueSaveCurrent(ui);
+        if (toolbarOnOneLine)
+            ImGui.SameLine();
+        if (ImGui.Button(ui.Close, new Vector2(toolbarButtonWidth, buttonHeight)))
+            open = false;
+
+        ShowNotice();
+        ImGui.Separator();
+        DrawManagerSectionTitle(ui.Search);
+        ImGui.SetNextItemWidth(-1f);
+        ImGui.InputText("##replay-search", ref _fileSearch, 128);
+
+        string search = _fileSearch.Trim();
+        if (!string.IsNullOrEmpty(search))
+        {
+            files = files.Where(entry =>
+                    entry.DisplayTitle.Contains(search, StringComparison.OrdinalIgnoreCase)
+                    || entry.SongName.Contains(search, StringComparison.OrdinalIgnoreCase)
+                    || entry.ArtistName.Contains(search, StringComparison.OrdinalIgnoreCase))
+                .ToList();
+        }
+
+        DrawManagerSectionTitle($"{ui.Files}: {files.Count}");
+        ImGui.Separator();
+        if (!ImGui.BeginChild(
+                "##ReplayFileList",
+                Vector2.Zero,
+                ImGuiChildFlags.Borders | ImGuiChildFlags.AlwaysUseWindowPadding,
+                ImGuiWindowFlags.AlwaysVerticalScrollbar))
+        {
+            ImGui.EndChild();
+            return;
+        }
+
+        if (files.Count == 0)
+        {
+            ImGui.TextDisabled(ui.NoFiles);
+        }
+        else
+        {
+            float rowHeight = Math.Max(
+                buttonHeight,
+                ImGui.GetTextLineHeightWithSpacing() * 2f + style.FramePadding.Y * 2f);
+            foreach (ReplayFileEntry entry in files)
+            {
+                string result = entry.Supported
+                    ? entry.Completed ? ui.Complete : ui.Failed
+                    : ui.Unsupported;
+                int progress = GetEndProgress(entry);
+                float titleWidth = Math.Max(
+                    80f,
+                    ImGui.GetContentRegionAvail().X - style.FramePadding.X * 2f);
+                string title = EllipsizeManagerText(GetReplayDisplayTitle(entry), titleWidth);
+                string metadata = $"{entry.RecordedAtUtc.ToLocalTime():MM-dd HH:mm}   {result}   {progress}%";
+                string label = $"{title}\n{metadata}##replay-{entry.Path}";
+                float rowWidth = Math.Max(1f, ImGui.GetContentRegionAvail().X);
+                if (!ImGui.Selectable(
+                        label,
+                        string.Equals(_selectedReplayPath, entry.Path, StringComparison.Ordinal),
+                        ImGuiSelectableFlags.None,
+                        new Vector2(rowWidth, rowHeight)))
+                    continue;
+
+                _selectedReplayPath = entry.Path;
+                _pendingDeletePath = "";
+                _deletePopupRequested = false;
+                _editingReplayPath = entry.Path;
+                _replayTitleEdit = entry.Title;
+                _managerShowingDetails = true;
+            }
+        }
+        ImGui.EndChild();
+    }
+
+    private void DrawReplayDetailsPage(UiText ui, ReplayFileEntry selected, ref bool open)
+    {
+        ImGuiStylePtr style = ImGui.GetStyle();
+        float buttonHeight = GetManagerButtonHeight();
+        float buttonWidth = Math.Max(
+            1f,
+            (ImGui.GetContentRegionAvail().X - style.ItemSpacing.X) * 0.5f);
+        if (ImGui.Button(ui.BackToList, new Vector2(buttonWidth, buttonHeight)))
+        {
+            _managerShowingDetails = false;
+            _pendingDeletePath = "";
+            _deletePopupRequested = false;
+        }
+        ImGui.SameLine();
+        if (ImGui.Button(ui.Close, new Vector2(buttonWidth, buttonHeight)))
+            open = false;
+
+        ShowNotice();
+        ImGui.Separator();
+        if (ImGui.BeginChild(
+                "##ReplayDetailsPage",
+                Vector2.Zero,
+                ImGuiChildFlags.Borders | ImGuiChildFlags.AlwaysUseWindowPadding,
+                ImGuiWindowFlags.AlwaysVerticalScrollbar))
+            DrawReplayDetails(ui, selected);
+        ImGui.EndChild();
+    }
+
     private void DrawReplayDetails(UiText ui, ReplayFileEntry selected)
     {
-        ImGui.TextUnformatted(ui.Details);
-        ImGui.TextWrapped(selected.SongName);
+        DrawManagerSectionTitle(ui.Details);
+        ImGui.TextWrapped(GetReplayDisplayTitle(selected));
+        if (!string.IsNullOrWhiteSpace(selected.Title))
+            DrawManagerMutedWrapped($"{ui.OriginalSong}: {CleanManagerText(selected.SongName)}");
         if (!string.IsNullOrWhiteSpace(selected.ArtistName))
-            ImGui.TextWrapped($"{ui.Artist}: {selected.ArtistName}");
-        ImGui.TextUnformatted($"{ui.RecordedAt}: {selected.RecordedAtUtc.ToLocalTime():yyyy-MM-dd HH:mm:ss}");
+            DrawManagerMutedWrapped($"{ui.Artist}: {CleanManagerText(selected.ArtistName)}");
+        ImGui.TextDisabled($"{ui.RecordedAt}: {selected.RecordedAtUtc.ToLocalTime():yyyy-MM-dd HH:mm:ss}");
         int startProgress = GetProgress(selected.StartTile, selected.TotalTiles);
         int endProgress = GetEndProgress(selected);
-        ImGui.TextUnformatted($"{ui.Progress}: {startProgress}% - {endProgress}%");
+        ImGui.TextDisabled($"{ui.Progress}: {startProgress}% - {endProgress}%");
         ImGui.ProgressBar(endProgress / 100f, new Vector2(-1f, 0f), $"{endProgress}%");
-        ImGui.TextUnformatted($"{ui.Inputs}: {selected.HitCount}");
-        ImGui.TextUnformatted($"{ui.Speed}: {selected.Speed:0.00}x");
-        ImGui.TextUnformatted($"{ui.Source}: {(selected.IsOfficialLevel ? ui.Official : ui.Custom)}");
+        ImGui.TextDisabled($"{ui.Inputs}: {selected.HitCount}");
+        ImGui.TextDisabled($"{ui.Speed}: {selected.Speed:0.00}x");
+        ImGui.TextDisabled($"{ui.Source}: {(selected.IsOfficialLevel ? ui.Official : ui.Custom)}");
         if (!selected.Supported)
         {
             ImGui.TextWrapped(selected.Error ?? ui.Unsupported);
         }
-        else if (ImGui.Button(ui.Play + "##manager-play"))
+        else
         {
-            QueueReplayFile(selected.Path, ui);
+            if (!string.Equals(_editingReplayPath, selected.Path, StringComparison.Ordinal))
+            {
+                _editingReplayPath = selected.Path;
+                _replayTitleEdit = selected.Title;
+            }
+
+            DrawManagerSectionTitle(ui.ReplayTitle);
+            ImGui.SetNextItemWidth(-1f);
+            ImGui.InputText("##replay-title-edit", ref _replayTitleEdit, 128);
+            bool titleChanged = !string.Equals(
+                _replayTitleEdit.Trim(),
+                selected.Title,
+                StringComparison.Ordinal);
+            ImGui.BeginDisabled(!titleChanged);
+            if (ImGui.Button(
+                    ui.SaveTitle + "##manager-save-title",
+                    new Vector2(-1f, GetManagerButtonHeight())))
+                SaveReplayTitle(selected, ui);
+            ImGui.EndDisabled();
         }
+
+        float actionButtonHeight = GetManagerButtonHeight();
+        ImGuiStylePtr style = ImGui.GetStyle();
+        float actionButtonWidth = selected.Supported
+            ? Math.Max(1f, (ImGui.GetContentRegionAvail().X - style.ItemSpacing.X) * 0.5f)
+            : -1f;
         if (selected.Supported)
+        {
+            if (ImGui.Button(ui.Play + "##manager-play", new Vector2(actionButtonWidth, actionButtonHeight)))
+                QueueReplayFile(selected.Path, ui);
             ImGui.SameLine();
-        if (ImGui.Button(ui.Delete + "##manager-delete"))
+        }
+        if (ImGui.Button(
+                ui.Delete + "##manager-delete",
+                new Vector2(actionButtonWidth, actionButtonHeight)))
         {
             _pendingDeletePath = selected.Path;
             _deletePopupRequested = true;
@@ -1345,18 +1597,120 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
         {
             ImGui.Separator();
             ImGui.TextWrapped(ui.ConfirmDelete);
-            if (ImGui.Button(ui.Delete + "##manager-confirm-delete"))
+            float confirmButtonWidth = Math.Max(
+                1f,
+                (ImGui.GetContentRegionAvail().X - style.ItemSpacing.X) * 0.5f);
+            if (ImGui.Button(
+                    ui.Delete + "##manager-confirm-delete",
+                    new Vector2(confirmButtonWidth, actionButtonHeight)))
             {
                 DeleteReplayFile(selected.Path);
                 _deletePopupRequested = false;
             }
             ImGui.SameLine();
-            if (ImGui.Button(ui.Cancel + "##manager-cancel-delete"))
+            if (ImGui.Button(
+                    ui.Cancel + "##manager-cancel-delete",
+                    new Vector2(confirmButtonWidth, actionButtonHeight)))
             {
                 _pendingDeletePath = "";
                 _deletePopupRequested = false;
             }
         }
+    }
+
+    private static float GetManagerButtonHeight()
+    {
+        return Math.Max(48f, ImGui.GetFrameHeight() * 1.12f);
+    }
+
+    private static bool CanFitManagerButtonRow(float availableWidth, params string[] labels)
+    {
+        ImGuiStylePtr style = ImGui.GetStyle();
+        float requiredWidth = style.ItemSpacing.X * Math.Max(0, labels.Length - 1);
+        foreach (string label in labels)
+        {
+            requiredWidth += Math.Max(
+                112f,
+                ImGui.CalcTextSize(label).X + style.FramePadding.X * 2f + 20f);
+        }
+        return availableWidth >= requiredWidth;
+    }
+
+    private static void DrawManagerSectionTitle(string text)
+    {
+        ImGui.Spacing();
+        ImGui.TextColored(new Vector4(0.45f, 0.78f, 0.96f, 1f), text);
+    }
+
+    private static void DrawManagerMutedWrapped(string text)
+    {
+        ImGui.PushStyleColor(ImGuiCol.Text, ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled]);
+        ImGui.TextWrapped(text);
+        ImGui.PopStyleColor();
+    }
+
+    private static string GetReplayDisplayTitle(ReplayFileEntry entry)
+    {
+        return CleanManagerText(
+            entry.DisplayTitle,
+            stripRichText: string.IsNullOrWhiteSpace(entry.Title));
+    }
+
+    private static string CleanManagerText(string value, bool stripRichText = true)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return "";
+
+        StringBuilder builder = new(value.Length);
+        bool insideTag = false;
+        bool pendingSpace = false;
+        foreach (char character in value)
+        {
+            if (stripRichText && character == '<')
+            {
+                insideTag = true;
+                continue;
+            }
+            if (insideTag)
+            {
+                if (character == '>')
+                    insideTag = false;
+                continue;
+            }
+            if (char.IsControl(character) || char.IsWhiteSpace(character))
+            {
+                pendingSpace = builder.Length > 0;
+                continue;
+            }
+            if (pendingSpace)
+                builder.Append(' ');
+            pendingSpace = false;
+            builder.Append(character);
+        }
+        return builder.ToString().TrimEnd();
+    }
+
+    private static string EllipsizeManagerText(string text, float maximumWidth)
+    {
+        if (string.IsNullOrEmpty(text) || ImGui.CalcTextSize(text).X <= maximumWidth)
+            return text;
+
+        const string suffix = "...";
+        float suffixWidth = ImGui.CalcTextSize(suffix).X;
+        int low = 0;
+        int high = text.Length;
+        while (low < high)
+        {
+            int middle = (low + high + 1) / 2;
+            float width = ImGui.CalcTextSize(text[..middle]).X + suffixWidth;
+            if (width <= maximumWidth)
+                low = middle;
+            else
+                high = middle - 1;
+        }
+        if (low > 0 && char.IsHighSurrogate(text[low - 1]))
+            low--;
+        return text[..low].TrimEnd() + suffix;
     }
 
     private void QueueReplayFile(string path, UiText ui)
@@ -1374,6 +1728,24 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
         }
     }
 
+    private void SaveReplayTitle(ReplayFileEntry selected, UiText ui)
+    {
+        try
+        {
+            string title = RequireStore().UpdateTitle(selected.Path, _replayTitleEdit);
+            _editingReplayPath = selected.Path;
+            _replayTitleEdit = title;
+            SetNotice(ui.TitleSaved);
+            SetToast(ui.TitleSaved);
+            RefreshFiles();
+        }
+        catch (Exception exception)
+        {
+            SetNotice(exception.Message);
+            Logger.Error(LogTag, $"Update replay title failed: {exception}");
+        }
+    }
+
     private void DeleteReplayFile(string path)
     {
         try
@@ -1381,6 +1753,9 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             File.Delete(path);
             _selectedReplayPath = "";
             _pendingDeletePath = "";
+            _editingReplayPath = "";
+            _replayTitleEdit = "";
+            _managerShowingDetails = false;
             RefreshFiles();
         }
         catch (Exception exception)
@@ -1666,6 +2041,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             SessionId = source.SessionId,
             RecordedAtUtc = source.RecordedAtUtc,
             SongName = source.SongName,
+            Title = source.Title,
             ArtistName = source.ArtistName,
             LevelPath = source.LevelPath,
             SceneName = source.SceneName,

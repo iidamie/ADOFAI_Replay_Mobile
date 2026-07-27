@@ -57,7 +57,12 @@ internal sealed record UiText(
     string ConfirmDelete,
     string Cancel,
     string Page,
-    string Artist)
+    string Artist,
+    string ReplayTitle,
+    string SaveTitle,
+    string TitleSaved,
+    string OriginalSong,
+    string BackToList)
 {
     internal static UiText FromLanguage(int language)
     {
@@ -77,7 +82,8 @@ internal sealed record UiText(
         "暂停", "继续", "停止回放", "打开回放管理器", "回放管理器", "回放", "搜索歌曲或作者", "回放文件", "刷新",
         "播放", "删除", "完成", "失败", "不支持", "没有回放文件", "当前没有可保存或回放的记录。", "操作已加入主线程队列。",
         "回放已保存", "无法加载回放", "关闭", "上一页", "下一页", "回放详情", "录制时间", "进度", "输入", "速度", "来源",
-        "官方谱面", "自定义谱面", "确认删除此回放？", "取消", "页", "艺术家");
+        "官方谱面", "自定义谱面", "确认删除此回放？", "取消", "页", "艺术家",
+        "回放标题", "保存标题", "标题已保存", "原始曲名", "返回列表");
 
     private static readonly UiText English = new(
         "Recording", "Loading replay", "Tap the game to start replay", "Replaying", "Replay paused", "Replay finished", "Replay ended on failure",
@@ -86,7 +92,8 @@ internal sealed record UiText(
         "Pause", "Resume", "Stop replay", "Open replay manager", "Replay Manager", "Replay", "Search song or artist", "Replay files", "Refresh",
         "Play", "Delete", "Complete", "Failed", "Unsupported", "No replay files", "There is no attempt to save or replay.", "Action queued on the game thread.",
         "Replay saved", "Could not load replay", "Close", "Previous", "Next", "Replay details", "Recorded", "Progress", "Inputs", "Speed", "Source",
-        "Official level", "Custom level", "Delete this replay?", "Cancel", "Page", "Artist");
+        "Official level", "Custom level", "Delete this replay?", "Cancel", "Page", "Artist",
+        "Replay title", "Save title", "Title saved", "Original song", "Back to list");
 
     private static readonly UiText Korean = new(
         "녹화 중", "리플레이 불러오는 중", "게임 화면을 눌러 리플레이 시작", "리플레이 중", "리플레이 일시정지", "리플레이 종료", "실패 지점에서 종료",
@@ -95,7 +102,8 @@ internal sealed record UiText(
         "일시정지", "계속", "리플레이 중지", "리플레이 관리자 열기", "리플레이 관리자", "리플레이", "곡 또는 아티스트 검색", "리플레이 파일", "새로고침",
         "재생", "삭제", "완료", "실패", "지원 안 함", "리플레이 파일 없음", "저장하거나 재생할 기록이 없습니다.", "게임 메인 스레드에 추가했습니다.",
         "리플레이 저장 완료", "리플레이를 불러올 수 없습니다", "닫기", "이전", "다음", "리플레이 정보", "녹화 시간", "진행률", "입력", "속도", "출처",
-        "공식 레벨", "커스텀 레벨", "이 리플레이를 삭제할까요?", "취소", "페이지", "아티스트");
+        "공식 레벨", "커스텀 레벨", "이 리플레이를 삭제할까요?", "취소", "페이지", "아티스트",
+        "리플레이 제목", "제목 저장", "제목 저장 완료", "원곡", "목록으로");
 
     private static readonly UiText Japanese = new(
         "記録中", "リプレイを読み込み中", "ゲーム画面をタップして開始", "リプレイ中", "一時停止中", "リプレイ終了", "失敗地点で終了",
@@ -104,5 +112,6 @@ internal sealed record UiText(
         "一時停止", "再開", "リプレイ停止", "リプレイ管理を開く", "リプレイ管理", "リプレイ", "曲名またはアーティストを検索", "リプレイファイル", "更新",
         "再生", "削除", "クリア", "失敗", "非対応", "リプレイなし", "保存または再生できる記録がありません。", "ゲームスレッドに追加しました。",
         "リプレイを保存しました", "リプレイを読み込めません", "閉じる", "前へ", "次へ", "リプレイ詳細", "記録日時", "進行度", "入力", "速度", "種類",
-        "公式レベル", "カスタムレベル", "このリプレイを削除しますか？", "キャンセル", "ページ", "アーティスト");
+        "公式レベル", "カスタムレベル", "このリプレイを削除しますか？", "キャンセル", "ページ", "アーティスト",
+        "リプレイ名", "名前を保存", "名前を保存しました", "元の曲名", "一覧へ戻る");
 }

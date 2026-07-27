@@ -1,12 +1,17 @@
 using System.Runtime.InteropServices;
 using System.Text.Json;
 using StArray.ModManager.Il2Cpp;
+using StArray.ModManager.Manager;
 using StArray.ModManager.RuntimeAbstractions;
 
 namespace Replay.Mobile;
 
 internal sealed class GameApi
 {
+    private const string CustomLevelSelectScene = "scnCLS";
+    private const int CustomLevelsScenePortal = 5;
+    private const int LocalCustomLevelCategory = 1;
+
     private readonly IAppDomain _domain;
     private readonly IRuntimeAssembly _gameAssembly;
     private readonly IRuntimeClass _controllerClass;
@@ -21,6 +26,7 @@ internal sealed class GameApi
     private readonly IRuntimeClass? _gameClass;
     private readonly IRuntimeClass? _levelDataClass;
     private readonly IRuntimeClass? _levelSelectClass;
+    private readonly IRuntimeClass? _customLevelSelectClass;
     private readonly IRuntimeClass? _gcsClass;
     private readonly IRuntimeClass? _rdStringClass;
 
@@ -73,6 +79,10 @@ internal sealed class GameApi
     private readonly IRuntimeField? _levelSelectRdFloor;
     private readonly IRuntimeField? _levelMakerInstance;
     private readonly IRuntimeField? _levelMakerFloors;
+    private readonly IRuntimeField? _customLevelSelectInitializing;
+    private readonly IRuntimeField? _customLevelSelectRefreshing;
+    private readonly IRuntimeField? _customLevelSelectLevelToSelect;
+    private readonly IRuntimeField? _customLevelSelectLoadedLevels;
 
     private readonly IRuntimeField? _checkpoint;
     private readonly IRuntimeField? _sceneToLoad;
@@ -97,6 +107,7 @@ internal sealed class GameApi
     private readonly IRuntimeMethod? _getIsLevelSelect;
     private readonly IRuntimeMethod? _getLevelSelect;
     private readonly IRuntimeMethod? _getLevelSelectBase;
+    private readonly IRuntimeMethod? _getCustomLevelSelect;
     private readonly IRuntimeMethod? _getLevelMaker;
     private readonly IRuntimeMethod? _getPercentComplete;
     private readonly IRuntimeMethod? _getPlayerAuto;
@@ -111,8 +122,11 @@ internal sealed class GameApi
     private readonly nint _setAudioPausedMethodInfo;
     private readonly EnterLevelDelegate? _enterLevel;
     private readonly nint _enterLevelMethodInfo;
-    private readonly LoadCustomLevelDelegate? _loadCustomLevel;
-    private readonly nint _loadCustomLevelMethodInfo;
+    private readonly PortalTravelActionDelegate? _portalTravelAction;
+    private readonly nint _portalTravelActionMethodInfo;
+    private readonly EnterCategoryDelegate? _customLevelSelectEnterCategory;
+    private readonly nint _customLevelSelectEnterCategoryMethodInfo;
+    private readonly IRuntimeMethod? _customLevelSelectEnterLevel;
     private readonly FindObjectDelegate? _findGameObject;
     private readonly nint _findGameObjectMethodInfo;
     private readonly InstantiateWithParentDelegate? _instantiateWithParent;
@@ -142,10 +156,14 @@ internal sealed class GameApi
 
     private nint _replayIslandFloorObject;
     private nint _replayIslandLabelObject;
+    private bool _customCategoryRequested;
 
     internal string LastLoadError { get; private set; } = "";
     internal string LastLoadRoute { get; private set; } = "";
-    internal bool CanLoadScenes => _loadCustomLevel != null;
+    internal bool WaitingForCustomLevelBrowser { get; private set; }
+    internal bool CanLoadScenes => _portalTravelAction != null
+        && _getCustomLevelSelect != null
+        && _customLevelSelectEnterLevel != null;
     internal bool CanCreateIslandFloor => CanCreateIslandEntry();
     internal string LastIslandEntryError { get; private set; } = "";
 
@@ -165,6 +183,7 @@ internal sealed class GameApi
         _gameClass = FindClass("", "scnGame");
         _levelDataClass = FindClass("ADOFAI", "LevelData");
         _levelSelectClass = FindClass("", "scnLevelSelect");
+        _customLevelSelectClass = FindClass("", "scnCLS");
         _gcsClass = FindClass("", "GCS");
         _rdStringClass = FindClass("", "RDString");
 
@@ -217,6 +236,10 @@ internal sealed class GameApi
         _levelSelectRdFloor = FindField(_levelSelectClass, "rdFloor");
         _levelMakerInstance = FindField(_levelMakerClass, "_instance", "instance");
         _levelMakerFloors = FindField(_levelMakerClass, "listFloors");
+        _customLevelSelectInitializing = FindField(_customLevelSelectClass, "initializing");
+        _customLevelSelectRefreshing = FindField(_customLevelSelectClass, "refreshing");
+        _customLevelSelectLevelToSelect = FindField(_customLevelSelectClass, "levelToSelect");
+        _customLevelSelectLoadedLevels = FindField(_customLevelSelectClass, "loadedLevels");
 
         _checkpoint = FindField(_gcsClass, "_checkpointNum", "checkpointNum");
         _sceneToLoad = FindField(_gcsClass, "sceneToLoad");
@@ -241,6 +264,7 @@ internal sealed class GameApi
         _getIsLevelSelect = _adoBaseClass?.GetMethod("get_isLevelSelect", 0);
         _getLevelSelect = _adoBaseClass?.GetMethod("get_levelSelect", 0);
         _getLevelSelectBase = _adoBaseClass?.GetMethod("get_levelSelectBase", 0);
+        _getCustomLevelSelect = _adoBaseClass?.GetMethod("get_cls", 0);
         _getLevelMaker = _adoBaseClass?.GetMethod("get_lm", 0)
             ?? _levelMakerClass?.GetMethod("get_instance", 0);
         _getPercentComplete = _controllerClass.GetMethod("get_percentComplete", 0);
@@ -280,13 +304,24 @@ internal sealed class GameApi
             _enterLevelMethodInfo = enterLevelMethod.Ptr;
         }
 
-        IRuntimeMethod? loadCustomLevelMethod = _controllerClass.GetMethod("LoadCustomLevel", 3);
-        nint loadCustomLevelPointer = loadCustomLevelMethod?.FunctionPtr ?? 0;
-        if (loadCustomLevelMethod != null && loadCustomLevelPointer != 0)
+        IRuntimeMethod? portalTravelActionMethod = _controllerClass.GetMethod("PortalTravelAction", 1);
+        nint portalTravelActionPointer = portalTravelActionMethod?.FunctionPtr ?? 0;
+        if (portalTravelActionMethod != null && portalTravelActionPointer != 0)
         {
-            _loadCustomLevel = Marshal.GetDelegateForFunctionPointer<LoadCustomLevelDelegate>(loadCustomLevelPointer);
-            _loadCustomLevelMethodInfo = loadCustomLevelMethod.Ptr;
+            _portalTravelAction = Marshal.GetDelegateForFunctionPointer<PortalTravelActionDelegate>(
+                portalTravelActionPointer);
+            _portalTravelActionMethodInfo = portalTravelActionMethod.Ptr;
         }
+
+        IRuntimeMethod? enterCategoryMethod = _customLevelSelectClass?.GetMethod("EnterCategory", 1);
+        nint enterCategoryPointer = enterCategoryMethod?.FunctionPtr ?? 0;
+        if (enterCategoryMethod != null && enterCategoryPointer != 0)
+        {
+            _customLevelSelectEnterCategory = Marshal.GetDelegateForFunctionPointer<EnterCategoryDelegate>(
+                enterCategoryPointer);
+            _customLevelSelectEnterCategoryMethodInfo = enterCategoryMethod.Ptr;
+        }
+        _customLevelSelectEnterLevel = _customLevelSelectClass?.GetMethod("EnterLevel", 0);
 
         IRuntimeClass? objectClass = FindClassInDomain("UnityEngine", "Object");
         IRuntimeClass? gameObjectClass = FindClassInDomain("UnityEngine", "GameObject");
@@ -408,6 +443,14 @@ internal sealed class GameApi
         {
         }
         return InvokeStaticObject(_getLevelSelect) != 0 || InvokeStaticObject(_getLevelSelectBase) != 0;
+    }
+
+    internal bool IsCustomLevelSelect()
+    {
+        return string.Equals(
+            InvokeStaticString(_getSceneName),
+            CustomLevelSelectScene,
+            StringComparison.OrdinalIgnoreCase);
     }
 
     internal bool EnsureReplayIslandEntry(int portalId, string label)
@@ -603,12 +646,16 @@ internal sealed class GameApi
             return false;
         }
 
+        string customLevelId = ReadString(_customLevelId, 0);
+        if (string.IsNullOrWhiteSpace(customLevelId))
+            customLevelId = GetCustomLevelKey(levelPath);
+
         identity = new ReplayLevelIdentity(
             songName,
             GetArtistName(),
             levelPath,
             "",
-            "",
+            customLevelId,
             false,
             totalTiles);
         return true;
@@ -824,6 +871,7 @@ internal sealed class GameApi
 
     internal bool LoadReplayLevel(ReplayData replay)
     {
+        CancelPendingCustomReplayLoad();
         LastLoadError = "";
         LastLoadRoute = "";
         try
@@ -861,29 +909,127 @@ internal sealed class GameApi
                 return FailLoad("找不到回放对应的自定义谱面文件。");
             if (!CustomLevelMatchesReplay(replay.LevelPath, replay.SongName, out string actualSong))
                 return FailLoad($"回放歌曲“{replay.SongName}”与目标谱面“{actualSong}”不匹配，已阻止加载以避免崩溃。");
-            RuntimeString path = RuntimeString.New(_domain, replay.LevelPath);
-            if (!path.IsValid)
-                return FailLoad("无法创建自定义谱面路径。");
-            if (_loadCustomLevel == null)
-                return FailLoad("当前游戏版本没有自定义谱面加载接口。");
+            string levelKey = GetReplayCustomLevelKey(replay);
+            if (string.IsNullOrWhiteSpace(levelKey))
+                return FailLoad("无法确定自定义关卡在游戏列表中的条目标识。");
+            if (_portalTravelAction == null || _getCustomLevelSelect == null
+                || _customLevelSelectEnterLevel == null)
+                return FailLoad("当前游戏版本没有完整的自定义关卡列表入口。");
 
             ApplyReplayGlobals(replay);
-            ResetLevelDestination();
-            LastLoadRoute = "scrController.LoadCustomLevel";
-            _loadCustomLevel(
-                controller,
-                path.Ptr,
-                nint.Zero,
-                0,
-                _loadCustomLevelMethodInfo);
-            ApplyReplayGlobals(replay);
-            bool requestReady = HasTargetScene(customLevel: true)
-                && Read(_customLevelPaths, 0, nint.Zero) != 0;
-            return requestReady || FailLoad("游戏没有建立自定义谱面加载请求。");
+            WaitingForCustomLevelBrowser = true;
+            _customCategoryRequested = false;
+            nint customLevelSelect = IsCustomLevelSelect()
+                ? InvokeStaticObject(_getCustomLevelSelect)
+                : 0;
+            if (customLevelSelect != 0)
+            {
+                LastLoadRoute = "scnCLS.EnterLevel (current custom-level browser)";
+                return true;
+            }
+
+            LastLoadRoute = "scrController.PortalTravelAction(CustomLevelsScene) -> scnCLS.EnterLevel";
+            _portalTravelAction(controller, CustomLevelsScenePortal, _portalTravelActionMethodInfo);
+            if (string.Equals(ReadString(_sceneToLoad, 0), CustomLevelSelectScene, StringComparison.Ordinal))
+                return true;
+            CancelPendingCustomReplayLoad();
+            return FailLoad("游戏没有建立自定义关卡界面转场请求。");
         }
         catch (Exception exception)
         {
+            CancelPendingCustomReplayLoad();
             return FailLoad(exception.Message);
+        }
+    }
+
+    internal CustomReplayLoadStatus AdvanceCustomReplayLoad(ReplayData replay)
+    {
+        if (!WaitingForCustomLevelBrowser)
+            return CustomReplayLoadStatus.Started;
+        if (_customLevelSelectEnterLevel == null)
+            return FailCustomReplayLoad("当前游戏版本没有自定义关卡列表的进入接口。");
+        if (!IsCustomLevelSelect())
+            return CustomReplayLoadStatus.Waiting;
+
+        nint customLevelSelect = InvokeStaticObject(_getCustomLevelSelect);
+        if (customLevelSelect == 0
+            || Read(_customLevelSelectInitializing, customLevelSelect, (byte)1) != 0
+            || Read(_customLevelSelectRefreshing, customLevelSelect, (byte)0) != 0)
+            return CustomReplayLoadStatus.Waiting;
+
+        string levelKey = GetReplayCustomLevelKey(replay);
+        RuntimeString runtimeLevelKey = RuntimeString.New(_domain, levelKey);
+        if (!runtimeLevelKey.IsValid)
+            return FailCustomReplayLoad("无法创建自定义关卡条目标识。");
+
+        nint loadedLevels = Read(_customLevelSelectLoadedLevels, customLevelSelect, nint.Zero);
+        if (loadedLevels == 0)
+            return CustomReplayLoadStatus.Waiting;
+        if (!DictionaryContainsStringKey(loadedLevels, runtimeLevelKey.Ptr))
+        {
+            if (!_customCategoryRequested && _customLevelSelectEnterCategory != null)
+            {
+                _customCategoryRequested = true;
+                _customLevelSelectEnterCategory(
+                    customLevelSelect,
+                    LocalCustomLevelCategory,
+                    _customLevelSelectEnterCategoryMethodInfo);
+            }
+            return CustomReplayLoadStatus.Waiting;
+        }
+
+        Write(_customLevelSelectLevelToSelect, customLevelSelect, runtimeLevelKey.Ptr);
+        ApplyReplayGlobals(replay);
+        if (!InvokeRuntimeMethod(
+                _customLevelSelectEnterLevel,
+                customLevelSelect,
+                null,
+                out nint enterException))
+            return FailCustomReplayLoad($"原生自定义关卡入口抛出 IL2CPP 异常：0x{enterException:X}");
+        ApplyReplayGlobals(replay);
+
+        nint customPaths = Read(_customLevelPaths, 0, nint.Zero);
+        int customPathCount = GetArrayLength(customPaths);
+        if (!HasTargetScene(customLevel: true) || customPaths == 0 || customPathCount == 0)
+            return FailCustomReplayLoad("原生自定义关卡入口没有建立有效的加载请求。");
+        if (!TrySelectCustomReplayPath(customPaths, replay.LevelPath, out int selectedIndex))
+            return FailCustomReplayLoad("游戏关卡条目中不包含回放对应的 .adofai 文件。");
+
+        WaitingForCustomLevelBrowser = false;
+        _customCategoryRequested = false;
+        LastLoadRoute = "scnCLS.EnterLevel -> scrController.LoadCustomWorld";
+        Logger.Info(
+            "Replay",
+            $"Native custom-level entry selected: key='{levelKey}', index={selectedIndex}, "
+            + $"count={customPathCount}, path='{replay.LevelPath}'");
+        return CustomReplayLoadStatus.Started;
+    }
+
+    internal void CancelPendingCustomReplayLoad()
+    {
+        WaitingForCustomLevelBrowser = false;
+        _customCategoryRequested = false;
+    }
+
+    private CustomReplayLoadStatus FailCustomReplayLoad(string message)
+    {
+        CancelPendingCustomReplayLoad();
+        LastLoadError = message;
+        return CustomReplayLoadStatus.Failed;
+    }
+
+    private static bool DictionaryContainsStringKey(nint dictionary, nint key)
+    {
+        try
+        {
+            return new RuntimeObject(dictionary).InvokeUnbox<byte>(
+                "ContainsKey",
+                1,
+                new nint[] { key }) != 0;
+        }
+        catch
+        {
+            return false;
         }
     }
 
@@ -892,7 +1038,11 @@ internal sealed class GameApi
         nint customPaths = Read(_customLevelPaths, 0, nint.Zero);
         return $"scene='{ReadString(_sceneToLoad, 0)}', "
             + $"internal='{ReadString(_internalLevelName, 0)}', "
-            + $"customPaths=0x{customPaths:X}, customIndex={Read(_customLevelIndex, 0, 0)}";
+            + $"customPaths=0x{customPaths:X}, customCount={GetArrayLength(customPaths)}, "
+            + $"customIndex={Read(_customLevelIndex, 0, 0)}, "
+            + $"customId='{ReadString(_customLevelId, 0)}', "
+            + $"browserPending={WaitingForCustomLevelBrowser}, "
+            + $"transitioning={Read(_controllerTransitioningLevel, GetController(), (byte)0) != 0}";
     }
 
     private bool IsSameLevel(ReplayData replay)
@@ -1063,13 +1213,102 @@ internal sealed class GameApi
 
     private bool HasTargetScene(bool customLevel)
     {
-        string scene = ReadString(_sceneToLoad, 0);
-        if (customLevel && string.IsNullOrWhiteSpace(scene))
+        return !string.IsNullOrWhiteSpace(ReadString(_sceneToLoad, 0));
+    }
+
+    private static unsafe bool InvokeRuntimeMethod(
+        IRuntimeMethod method,
+        nint instance,
+        nint[]? arguments,
+        out nint exception)
+    {
+        exception = 0;
+        fixed (nint* argumentPointer = arguments)
+            Il2CppFunctions.il2cpp_runtime_invoke(
+                method.Ptr,
+                instance,
+                (void**)argumentPointer,
+                ref exception);
+        return exception == 0;
+    }
+
+    private static string GetReplayCustomLevelKey(ReplayData replay)
+    {
+        if (!string.IsNullOrWhiteSpace(replay.LevelId))
+            return replay.LevelId.Trim();
+        return GetCustomLevelKey(replay.LevelPath);
+    }
+
+    private static string GetCustomLevelKey(string levelPath)
+    {
+        try
         {
-            scene = "scnGame";
-            WriteString(_sceneToLoad, scene);
+            string? directory = Path.GetDirectoryName(Path.GetFullPath(levelPath));
+            return string.IsNullOrWhiteSpace(directory)
+                ? ""
+                : Path.GetFileName(directory.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
         }
-        return !string.IsNullOrWhiteSpace(scene);
+        catch
+        {
+            return "";
+        }
+    }
+
+    private bool TrySelectCustomReplayPath(nint customPaths, string targetPath, out int selectedIndex)
+    {
+        selectedIndex = -1;
+        try
+        {
+            RuntimeArray<nint> paths = new(customPaths);
+            for (int index = 0; index < paths.Length; index++)
+            {
+                nint value = paths[index];
+                if (value == 0)
+                    continue;
+                string candidate = new RuntimeString(value).ToString();
+                if (!FilePathsEqual(candidate, targetPath))
+                    continue;
+                selectedIndex = index;
+                break;
+            }
+        }
+        catch
+        {
+            selectedIndex = -1;
+        }
+        if (selectedIndex < 0)
+            return false;
+        Write(_customLevelIndex, 0, selectedIndex);
+        return true;
+    }
+
+    private static bool FilePathsEqual(string left, string right)
+    {
+        try
+        {
+            return string.Equals(
+                Path.GetFullPath(left),
+                Path.GetFullPath(right),
+                StringComparison.OrdinalIgnoreCase);
+        }
+        catch
+        {
+            return string.Equals(left, right, StringComparison.OrdinalIgnoreCase);
+        }
+    }
+
+    private static int GetArrayLength(nint array)
+    {
+        if (array == 0)
+            return 0;
+        try
+        {
+            return new RuntimeArray(array).Length;
+        }
+        catch
+        {
+            return 0;
+        }
     }
 
     private static bool CustomLevelMatchesReplay(string path, string replaySong, out string actualSong)
@@ -1328,12 +1567,10 @@ internal sealed class GameApi
     private delegate void EnterLevelDelegate(nint instance, nint levelId, byte speedTrial, nint methodInfo);
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-    private delegate void LoadCustomLevelDelegate(
-        nint instance,
-        nint path,
-        nint customLevelId,
-        byte fromBundle,
-        nint methodInfo);
+    private delegate void PortalTravelActionDelegate(nint instance, int destination, nint methodInfo);
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    private delegate void EnterCategoryDelegate(nint instance, int category, nint methodInfo);
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     private delegate nint FindObjectDelegate(nint name, nint methodInfo);

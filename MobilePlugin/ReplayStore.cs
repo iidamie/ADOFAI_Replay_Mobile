@@ -74,6 +74,16 @@ internal sealed class ReplayStore
         return replay;
     }
 
+    internal string UpdateTitle(string path, string title)
+    {
+        ReplayData replay = Load(path);
+        replay.Title = NormalizeTitle(title);
+        Validate(replay);
+        string json = JsonSerializer.Serialize(replay, ReplayJsonContext.Default.ReplayData);
+        WriteAtomic(path, json);
+        return replay.Title;
+    }
+
     internal List<ReplayFileEntry> Scan(string configuredPath)
     {
         string directory = ResolveDirectory(configuredPath);
@@ -89,6 +99,7 @@ internal sealed class ReplayStore
                 ReplayData replay = Load(path);
                 entries.Add(new ReplayFileEntry(
                     path,
+                    replay.Title,
                     replay.SongName,
                     replay.ArtistName,
                     replay.RecordedAtUtc,
@@ -107,6 +118,7 @@ internal sealed class ReplayStore
             {
                 entries.Add(new ReplayFileEntry(
                     path,
+                    "",
                     Path.GetFileNameWithoutExtension(path),
                     "",
                     File.GetLastWriteTimeUtc(path),
@@ -159,6 +171,7 @@ internal sealed class ReplayStore
             throw new InvalidDataException($"不支持回放格式版本 {replay.FormatVersion}。");
         replay.Hits ??= new List<ReplayHit>();
         replay.SongName = string.IsNullOrWhiteSpace(replay.SongName) ? "Unknown" : replay.SongName.Trim();
+        replay.Title = NormalizeTitle(replay.Title);
         replay.ArtistName ??= "";
         replay.LevelPath ??= "";
         replay.SceneName ??= "";
@@ -208,6 +221,32 @@ internal sealed class ReplayStore
         if (string.IsNullOrEmpty(sanitized))
             sanitized = "Replay";
         return sanitized.Length <= 48 ? sanitized : sanitized[..48];
+    }
+
+    private static string NormalizeTitle(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return "";
+
+        StringBuilder builder = new(Math.Min(value.Length, 96));
+        bool pendingSpace = false;
+        foreach (char character in value.Trim())
+        {
+            if (char.IsControl(character))
+                continue;
+            if (char.IsWhiteSpace(character))
+            {
+                pendingSpace = builder.Length > 0;
+                continue;
+            }
+            if (pendingSpace && builder.Length < 96)
+                builder.Append(' ');
+            pendingSpace = false;
+            if (builder.Length >= 96)
+                break;
+            builder.Append(character);
+        }
+        return builder.ToString().TrimEnd();
     }
 
     private static void WriteAtomic(string path, string json, string? temporaryPath = null)

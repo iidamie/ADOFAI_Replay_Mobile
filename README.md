@@ -7,11 +7,12 @@
 - 自动记录成功判定、提前按、过早/过晚空拍等每次输入的瓦片序号、行星角度偏差、HitMargin、自动判定与 No Fail 状态
 - 提供 PC 版同类的细分保存策略：完整通关、任意起点通关、每次失败、90% 后失败，也可手动保存
 - 从原始起点或检查点重载关卡，并屏蔽真实触摸后注入记录的判定
-- 所有跨自定义谱面回放统一调用游戏原生 `scrController.LoadCustomLevel` 完整转场，由游戏安全建立 IL2CPP 路径数组；不再调用可能破坏当前场景状态的 `scnGame.LoadAndPlayLevel`
+- 跨自定义谱面回放先通过 `PortalTravelAction(CustomLevelsScene)` 进入游戏原生自定义关卡界面，等待 `scnCLS` 扫描完成后调用其 `EnterLevel`；由游戏按正常游玩记录执行 `LoadCustomWorld`，Mod 不再从主界面直接调用 `LoadCustomLevel` 或 `scnGame.LoadAndPlayLevel`
+- ImGui 入口只提交命令，暂停、恢复和谱面加载都在 `scrController.Update` 所在的游戏主线程执行
 - 通过控制器状态检测谱面转场，不占用 `scrController.StartLoadingScene` Hook，可与 ShowBPM 同时启用
 - 使用新版 StArray.ModManager 的 `[UnmanagedHook]` Source Generator 安装和卸载游戏 Hook，不再手工维护 Dobby trampoline
-- 开始岛显示 ImGui 回放入口，可打开独立全屏回放管理器；游戏、设置和其他场景中自动隐藏
-- 回放管理器支持搜索、分页、进度与来源详情、播放和删除确认
+- 开始岛和自定义关卡选择页右下角显示 ImGui 回放入口，可打开独立全屏回放管理器；游戏、设置和其他场景中自动隐藏
+- 回放管理器使用适合横屏触控的双行滚动列表和等宽大按钮；点击条目进入独立详情页，可编辑回放标题、查看进度与来源、播放或删除，返回后继续浏览列表
 - 回放时在左下角提供暂停/继续和中止按钮；失败或通关后恢复原版结算并自动释放输入锁
 - 通关结算页或失败进度页左下角保留本局录制的手动保存按钮，未达到自动保存条件的记录也可以保存
 - 左下角操作窗口会跟随新版管理器的字体与样式缩放，避免高 DPI 手机上按钮被裁剪

@@ -5,10 +5,11 @@ namespace Replay.Mobile;
 public sealed class ReplayData
 {
     public int FormatVersion { get; set; } = 1;
-    public string ModVersion { get; set; } = "1.4.2-mobile.16";
+    public string ModVersion { get; set; } = "1.4.2-mobile.25";
     public string SessionId { get; set; } = Guid.NewGuid().ToString("N");
     public DateTime RecordedAtUtc { get; set; } = DateTime.UtcNow;
     public string SongName { get; set; } = "Unknown";
+    public string Title { get; set; } = "";
     public string ArtistName { get; set; } = "";
     public string LevelPath { get; set; } = "";
     public string SceneName { get; set; } = "";
@@ -87,7 +88,15 @@ internal enum ReplayRunState
 internal enum ReplayLoadStage
 {
     None,
+    WaitingForCustomLevelBrowser,
     WaitingForTargetStart,
+}
+
+internal enum CustomReplayLoadStatus
+{
+    Waiting,
+    Started,
+    Failed,
 }
 
 internal enum ReplayCommandKind
@@ -97,12 +106,15 @@ internal enum ReplayCommandKind
     Play,
     Stop,
     TogglePause,
+    PauseForManager,
+    ResumeAfterManager,
 }
 
 internal sealed record ReplayCommand(ReplayCommandKind Kind, ReplayData? Replay = null);
 
 internal sealed record ReplayFileEntry(
     string Path,
+    string Title,
     string SongName,
     string ArtistName,
     DateTime RecordedAtUtc,
@@ -115,4 +127,7 @@ internal sealed record ReplayFileEntry(
     bool Completed,
     bool NativeFormat,
     bool Supported,
-    string? Error);
+    string? Error)
+{
+    internal string DisplayTitle => string.IsNullOrWhiteSpace(Title) ? SongName : Title;
+}

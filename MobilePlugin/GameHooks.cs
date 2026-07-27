@@ -194,6 +194,9 @@ public static partial class GameHooks
     private static void StartRewind(nint instance, int sequenceId, nint methodInfo)
     {
         ReplayPlugin? plugin = _plugin;
+        bool pendingReplay = plugin?.IsReplayTargetStartPending == true;
+        if (pendingReplay)
+            Logger.Info(LogTag, $"Replay target Start_Rewind entered: tile {sequenceId}");
         try
         {
             sequenceId = plugin?.GetStartTile(sequenceId) ?? sequenceId;
@@ -212,6 +215,8 @@ public static partial class GameHooks
             Logger.Error(LogTag, $"Start_Rewind trampoline failed: {exception}");
             return;
         }
+        if (pendingReplay)
+            Logger.Info(LogTag, "Replay target Start_Rewind original completed");
 
         try
         {
