@@ -70,7 +70,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
 
     public string Id => "Replay";
     public string Name => "ADOFAI Replay";
-    public string Version => "1.4.2-mobile.15";
+    public string Version => "1.4.2-mobile.16";
     public string Author => "Flower / ADOFAI.gg";
     public string Description => "Record and replay ADOFAI mobile runs with IL2CPP-native hooks";
     public IReadOnlyList<string> Dependencies => Array.Empty<string>();
@@ -330,7 +330,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
         {
             ReplayData? replay = _activeReplay ?? _pendingReplay;
             bool targetLevelStarting = _activeReplay != null
-                || _loadStage is ReplayLoadStage.WaitingForTargetStart or ReplayLoadStage.LoadingCustomLevel;
+                || _loadStage == ReplayLoadStage.WaitingForTargetStart;
             return replay != null
                 && targetLevelStarting
                 && _runState is not ReplayRunState.Finished and not ReplayRunState.Failed
@@ -354,15 +354,6 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
         {
             if (_pendingReplay != null)
             {
-                if (_loadStage == ReplayLoadStage.EnteringGameScene)
-                {
-                    _loadStage = ReplayLoadStage.ReadyToLoadCustomLevel;
-                    Logger.Info(LogTag, "Game scene ready for custom replay");
-                    return;
-                }
-                if (_loadStage == ReplayLoadStage.ReadyToLoadCustomLevel)
-                    return;
-
                 _activeReplay = _pendingReplay;
                 _pendingReplay = null;
                 _loadStage = ReplayLoadStage.None;
@@ -440,8 +431,6 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
                     break;
             }
         }
-
-        ContinuePendingReplayLoad();
         EnsureAttemptStarted(controller);
     }
 
@@ -869,9 +858,6 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
 
         StopPlaybackNow(resumeRecording: false);
         ReplayData pendingReplay = CloneReplay(replay)!;
-        bool needsGameSceneBridge = !pendingReplay.IsOfficialLevel
-            && !game.CanHotLoadCustomReplayLevel()
-            && !game.CanLoadScenes;
         lock (_stateLock)
         {
             ClearResultAttemptLocked();
@@ -879,9 +865,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             _pendingReplay = pendingReplay;
             _currentAttempt = null;
             _runState = ReplayRunState.Loading;
-            _loadStage = needsGameSceneBridge
-                ? ReplayLoadStage.EnteringGameScene
-                : ReplayLoadStage.WaitingForTargetStart;
+            _loadStage = ReplayLoadStage.WaitingForTargetStart;
             _replayIndex = 0;
             _recording = false;
         }
@@ -908,40 +892,6 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             return;
         }
         Logger.Info(LogTag, $"Replay load requested via {game.LastLoadRoute}: {game.GetReplayLoadState()}");
-    }
-
-    private void ContinuePendingReplayLoad()
-    {
-        GameApi? game = _game;
-        ReplayData? replay;
-        lock (_stateLock)
-        {
-            if (game == null
-                || _pendingReplay == null
-                || _loadStage != ReplayLoadStage.ReadyToLoadCustomLevel)
-                return;
-            replay = CloneReplay(_pendingReplay);
-            _loadStage = ReplayLoadStage.LoadingCustomLevel;
-        }
-
-        if (replay != null && game.LoadReplayLevel(replay))
-        {
-            Logger.Info(LogTag, $"Replay load requested via {game.LastLoadRoute}: {game.GetReplayLoadState()}");
-            return;
-        }
-
-        lock (_stateLock)
-        {
-            _activeReplay = null;
-            _pendingReplay = null;
-            _runState = ReplayRunState.Idle;
-            _loadStage = ReplayLoadStage.None;
-        }
-        string error = string.IsNullOrWhiteSpace(game.LastLoadError)
-            ? UiText.FromLanguage(_languageCode).LoadFailed
-            : game.LastLoadError;
-        SetNotice(error);
-        Logger.Error(LogTag, $"Could not hot-load pending custom replay: {error}");
     }
 
     private void TogglePauseNow()

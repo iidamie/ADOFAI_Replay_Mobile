@@ -5,7 +5,7 @@ namespace Replay.Mobile;
 public sealed class ReplayData
 {
     public int FormatVersion { get; set; } = 1;
-    public string ModVersion { get; set; } = "1.4.2-mobile.15";
+    public string ModVersion { get; set; } = "1.4.2-mobile.16";
     public string SessionId { get; set; } = Guid.NewGuid().ToString("N");
     public DateTime RecordedAtUtc { get; set; } = DateTime.UtcNow;
     public string SongName { get; set; } = "Unknown";
@@ -88,9 +88,6 @@ internal enum ReplayLoadStage
 {
     None,
     WaitingForTargetStart,
-    EnteringGameScene,
-    ReadyToLoadCustomLevel,
-    LoadingCustomLevel,
 }
 
 internal enum ReplayCommandKind

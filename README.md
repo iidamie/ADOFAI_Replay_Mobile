@@ -7,7 +7,7 @@
 - 自动记录成功判定、提前按、过早/过晚空拍等每次输入的瓦片序号、行星角度偏差、HitMargin、自动判定与 No Fail 状态
 - 提供 PC 版同类的细分保存策略：完整通关、任意起点通关、每次失败、90% 后失败，也可手动保存
 - 从原始起点或检查点重载关卡，并屏蔽真实触摸后注入记录的判定
-- 第三方谱面之间使用 `scnGame.LoadAndPlayLevel` 原地热重载；从主岛进入时调用游戏原生 `scrController.LoadCustomLevel`，由游戏安全建立 IL2CPP 自定义谱面路径数组
+- 所有跨自定义谱面回放统一调用游戏原生 `scrController.LoadCustomLevel` 完整转场，由游戏安全建立 IL2CPP 路径数组；不再调用可能破坏当前场景状态的 `scnGame.LoadAndPlayLevel`
 - 通过控制器状态检测谱面转场，不占用 `scrController.StartLoadingScene` Hook，可与 ShowBPM 同时启用
 - 使用新版 StArray.ModManager 的 `[UnmanagedHook]` Source Generator 安装和卸载游戏 Hook，不再手工维护 Dobby trampoline
 - 开始岛显示 ImGui 回放入口，可打开独立全屏回放管理器；游戏、设置和其他场景中自动隐藏

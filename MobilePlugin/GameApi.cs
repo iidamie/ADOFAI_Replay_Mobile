@@ -111,12 +111,8 @@ internal sealed class GameApi
     private readonly nint _setAudioPausedMethodInfo;
     private readonly EnterLevelDelegate? _enterLevel;
     private readonly nint _enterLevelMethodInfo;
-    private readonly LoadSceneDelegate? _loadScene;
-    private readonly nint _loadSceneMethodInfo;
     private readonly LoadCustomLevelDelegate? _loadCustomLevel;
     private readonly nint _loadCustomLevelMethodInfo;
-    private readonly LoadAndPlayLevelDelegate? _loadAndPlayLevel;
-    private readonly nint _loadAndPlayLevelMethodInfo;
     private readonly FindObjectDelegate? _findGameObject;
     private readonly nint _findGameObjectMethodInfo;
     private readonly InstantiateWithParentDelegate? _instantiateWithParent;
@@ -284,34 +280,12 @@ internal sealed class GameApi
             _enterLevelMethodInfo = enterLevelMethod.Ptr;
         }
 
-        IRuntimeClass? sceneManagerClass = FindClassInDomain(
-            "UnityEngine.SceneManagement",
-            "SceneManager");
-        IRuntimeMethod? loadSceneMethod = sceneManagerClass?.GetMethod(
-            "LoadScene",
-            new[] { "System.String" })
-            ?? sceneManagerClass?.GetMethod("LoadScene", new[] { "String" });
-        nint loadScenePointer = loadSceneMethod?.FunctionPtr ?? 0;
-        if (loadSceneMethod != null && loadScenePointer != 0)
-        {
-            _loadScene = Marshal.GetDelegateForFunctionPointer<LoadSceneDelegate>(loadScenePointer);
-            _loadSceneMethodInfo = loadSceneMethod.Ptr;
-        }
-
         IRuntimeMethod? loadCustomLevelMethod = _controllerClass.GetMethod("LoadCustomLevel", 3);
         nint loadCustomLevelPointer = loadCustomLevelMethod?.FunctionPtr ?? 0;
         if (loadCustomLevelMethod != null && loadCustomLevelPointer != 0)
         {
             _loadCustomLevel = Marshal.GetDelegateForFunctionPointer<LoadCustomLevelDelegate>(loadCustomLevelPointer);
             _loadCustomLevelMethodInfo = loadCustomLevelMethod.Ptr;
-        }
-
-        IRuntimeMethod? loadAndPlayLevelMethod = _gameClass?.GetMethod("LoadAndPlayLevel", 1);
-        nint loadAndPlayLevelPointer = loadAndPlayLevelMethod?.FunctionPtr ?? 0;
-        if (loadAndPlayLevelMethod != null && loadAndPlayLevelPointer != 0)
-        {
-            _loadAndPlayLevel = Marshal.GetDelegateForFunctionPointer<LoadAndPlayLevelDelegate>(loadAndPlayLevelPointer);
-            _loadAndPlayLevelMethodInfo = loadAndPlayLevelMethod.Ptr;
         }
 
         IRuntimeClass? objectClass = FindClassInDomain("UnityEngine", "Object");
@@ -434,14 +408,6 @@ internal sealed class GameApi
         {
         }
         return InvokeStaticObject(_getLevelSelect) != 0 || InvokeStaticObject(_getLevelSelectBase) != 0;
-    }
-
-    internal bool CanHotLoadCustomReplayLevel()
-    {
-        nint controller = GetController();
-        return _loadAndPlayLevel != null
-            && IsGameWorld(controller)
-            && Read(_gameInstance, 0, nint.Zero) != 0;
     }
 
     internal bool EnsureReplayIslandEntry(int portalId, string label)
@@ -898,46 +864,22 @@ internal sealed class GameApi
             RuntimeString path = RuntimeString.New(_domain, replay.LevelPath);
             if (!path.IsValid)
                 return FailLoad("无法创建自定义谱面路径。");
+            if (_loadCustomLevel == null)
+                return FailLoad("当前游戏版本没有自定义谱面加载接口。");
 
-            nint currentGame = Read(_gameInstance, 0, nint.Zero);
-            if (currentGame != 0
-                && IsGameWorld(controller)
-                && _loadAndPlayLevel != null)
-            {
-                ApplyReplayGlobals(replay);
-                LastLoadRoute = "scnGame.LoadAndPlayLevel";
-                return _loadAndPlayLevel(currentGame, path.Ptr, _loadAndPlayLevelMethodInfo) != 0
-                    || FailLoad("当前游戏场景无法热重载目标自定义谱面。");
-            }
-
-            if (_loadCustomLevel != null)
-            {
-                ApplyReplayGlobals(replay);
-                ResetLevelDestination();
-                LastLoadRoute = "scrController.LoadCustomLevel";
-                _loadCustomLevel(
-                    controller,
-                    path.Ptr,
-                    nint.Zero,
-                    0,
-                    _loadCustomLevelMethodInfo);
-                ApplyReplayGlobals(replay);
-                return HasTargetScene(customLevel: true)
-                    && Read(_customLevelPaths, 0, nint.Zero) != 0
-                    || FailLoad("游戏没有建立自定义谱面加载请求。");
-            }
-
-            if (_enterLevel == null)
-                return FailLoad("当前游戏版本没有可用的游戏场景入口。");
-            RuntimeString bridgeLevel = RuntimeString.New(_domain, "1-X");
-            if (!bridgeLevel.IsValid)
-                return FailLoad("无法创建游戏场景过渡关卡 ID。");
-            Write(_checkpoint, 0, 0);
+            ApplyReplayGlobals(replay);
             ResetLevelDestination();
-            LastLoadRoute = "scrController.EnterLevel (custom replay bridge)";
-            _enterLevel(controller, bridgeLevel.Ptr, 0, _enterLevelMethodInfo);
-            return HasTargetScene(customLevel: false)
-                || FailLoad("无法进入用于加载自定义回放的游戏场景。");
+            LastLoadRoute = "scrController.LoadCustomLevel";
+            _loadCustomLevel(
+                controller,
+                path.Ptr,
+                nint.Zero,
+                0,
+                _loadCustomLevelMethodInfo);
+            ApplyReplayGlobals(replay);
+            bool requestReady = HasTargetScene(customLevel: true)
+                && Read(_customLevelPaths, 0, nint.Zero) != 0;
+            return requestReady || FailLoad("游戏没有建立自定义谱面加载请求。");
         }
         catch (Exception exception)
         {
@@ -1386,18 +1328,12 @@ internal sealed class GameApi
     private delegate void EnterLevelDelegate(nint instance, nint levelId, byte speedTrial, nint methodInfo);
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-    private delegate void LoadSceneDelegate(nint sceneName, nint methodInfo);
-
-    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     private delegate void LoadCustomLevelDelegate(
         nint instance,
         nint path,
         nint customLevelId,
         byte fromBundle,
         nint methodInfo);
-
-    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-    private delegate byte LoadAndPlayLevelDelegate(nint instance, nint path, nint methodInfo);
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     private delegate nint FindObjectDelegate(nint name, nint methodInfo);
