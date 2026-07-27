@@ -1,0 +1,25 @@
+# Build output
+**/bin/
+**/obj/
+artifacts/
+tmp_package/
+
+# Local SDK and game references
+References/*.dll
+References/*.xml
+
+# Packaged releases are uploaded through GitHub Releases
+Replay-*.zip
+
+# IDE and user files
+.idea/
+.vs/
+.vscode/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# OS files
+.DS_Store
+Thumbs.db
