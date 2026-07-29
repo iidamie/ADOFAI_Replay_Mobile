@@ -73,6 +73,8 @@ mods/
 ## 致谢
 
 - PC 原版：[ADOFAI-gg/ADOFAI-Replay](https://github.com/ADOFAI-gg/ADOFAI-Replay)
-- 手机端加载器与模板：[StArraySharp/UnityModTemplate](https://github.com/StArraySharp/UnityModTemplate)
+- 手机端加载器与模板：
+[StArraySharp/StArray.ModManager](https://github.com/StArraySharp/StArray.ModManager)
+[StArraySharp/UnityModTemplate](https://github.com/StArraySharp/UnityModTemplate)
 
 仓库不包含《冰与火之舞》游戏程序集或 StArray.ModManager 的本地构建引用。
