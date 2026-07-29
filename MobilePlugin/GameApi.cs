@@ -788,6 +788,16 @@ internal sealed class GameApi
         return Read(_checkpoint, 0, 0);
     }
 
+    /// <summary>
+    /// 写入 <c>GCS.checkpointNum</c>。这是游戏判断“本局从哪一砖开始”的唯一权威字段：
+    /// <c>WaitForStartCo</c> 用它把行星 <c>ScrubToFloorNumber</c> 到起始砖，
+    /// <c>FinishCustomLevelLoading</c> 用它设置 <c>currentSeqID</c>。
+    /// </summary>
+    internal void SetCheckpoint(int tile)
+    {
+        Write(_checkpoint, 0, Math.Max(0, tile));
+    }
+
     internal float GetBpm()
     {
         return Read(_conductorBpm, GetConductor(), 0f);

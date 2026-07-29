@@ -5,7 +5,7 @@ namespace Replay.Mobile;
 public sealed class ReplayData
 {
     public int FormatVersion { get; set; } = 1;
-    public string ModVersion { get; set; } = "1.4.2-mobile.25";
+    public string ModVersion { get; set; } = ReplayPlugin.ModVersion;
     public string SessionId { get; set; } = Guid.NewGuid().ToString("N");
     public DateTime RecordedAtUtc { get; set; } = DateTime.UtcNow;
     public string SongName { get; set; } = "Unknown";

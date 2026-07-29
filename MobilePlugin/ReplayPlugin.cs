@@ -74,10 +74,26 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
 
     public string Id => "Replay";
     public string Name => "ADOFAI Replay";
-    public string Version => "1.4.2-mobile.25";
+    public string Version => ModVersion;
     public string Author => "Flower / ADOFAI.gg";
     public string Description => "Record and replay ADOFAI mobile runs with IL2CPP-native hooks";
     public IReadOnlyList<string> Dependencies => Array.Empty<string>();
+
+    /// <summary>
+    /// 从程序集元数据读取版本号，保证与 Replay.csproj 的 &lt;Version&gt; 始终一致，
+    /// 不会再出现「csproj 已升级但插件里仍是旧硬编码字符串」的情况。
+    /// </summary>
+    internal static string ModVersion { get; } = ResolveModVersion();
+
+    private static string ResolveModVersion()
+    {
+        string? informational = typeof(ReplayPlugin).Assembly
+            .GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion;
+        if (string.IsNullOrWhiteSpace(informational))
+            return typeof(ReplayPlugin).Assembly.GetName().Version?.ToString() ?? "1.4.2";
+        int metadataSeparator = informational.IndexOf('+');
+        return metadataSeparator < 0 ? informational : informational[..metadataSeparator];
+    }
 
     internal bool IsReplayActive
     {
@@ -365,6 +381,36 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
         }
     }
 
+    /// <summary>
+    /// 把待播放回放的起始砖重新写回 <c>GCS.checkpointNum</c>。
+    /// scrController.Awake 会在场景切换时清零该字段（previousScene 变化、以及
+    /// gameworld/speedTrialMode 分支），而 WaitForStartCo 又靠它把行星
+    /// <c>ScrubToFloorNumber</c> 到起点、FinishCustomLevelLoading 靠它设置 currentSeqID。
+    /// 因此从检查点录制的回放必须在关卡真正开始前把该值补回去，否则会从第 0 砖开始播放。
+    /// </summary>
+    internal void RestoreReplayCheckpoint()
+    {
+        GameApi? game = _game;
+        if (game == null)
+            return;
+
+        int startTile;
+        lock (_stateLock)
+        {
+            ReplayData? replay = _pendingReplay ?? _activeReplay;
+            if (replay == null
+                || _runState is ReplayRunState.Finished or ReplayRunState.Failed)
+                return;
+            // 回放已经开始推进后就不要再改写 checkpointNum，避免干扰游戏自身的检查点逻辑。
+            if (_activeReplay != null && _runState is not ReplayRunState.WaitingForStart)
+                return;
+            startTile = replay.StartTile;
+        }
+        if (startTile <= 0 || game.GetCheckpoint() == startTile)
+            return;
+        game.SetCheckpoint(startTile);
+    }
+
     internal void HandleStartRewind(nint controller, int sequenceId)
     {
         if (_game == null)
@@ -441,6 +487,9 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
         DetectLevelTransition(controller);
         if (controller != 0)
             _controller = controller;
+        // 关卡加载期间 scrController.Awake 会清零 checkpointNum，这里在游戏主线程持续补回，
+        // 直到回放真正开始推进为止。
+        RestoreReplayCheckpoint();
         _languageCode = _game?.GetLanguageCode() ?? _languageCode;
         while (_commands.TryDequeue(out ReplayCommand? command))
         {
@@ -947,6 +996,25 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
         SaveReplayNow(replay);
     }
 
+    /// <summary>
+    /// 修正 `1.4.2-mobile.25` 及更早版本录制的回放：那些版本把 Start_Rewind 的参数（常规路径为 -1）
+    /// 当成起点，所以从检查点续关的记录会被错误写成 <c>StartTile = 0</c>。
+    /// 这里用第一条判定的砖号还原真实起点——回放的第一次判定必然发生在起始砖上，
+    /// 否则播放循环会一直等待一个永远不会到达的砖号。
+    /// </summary>
+    private void RepairLegacyStartTile(ReplayData replay)
+    {
+        if (replay.Hits.Count == 0 || replay.StartTile > 0)
+            return;
+        int firstSequence = replay.Hits[0].SequenceId;
+        if (firstSequence <= 0)
+            return;
+        replay.StartTile = firstSequence;
+        Logger.Info(
+            LogTag,
+            $"Repaired legacy replay start tile: {replay.SongName} -> tile {firstSequence}");
+    }
+
     private void StartPlaybackNow(ReplayData replay)
     {
         GameApi? game = _game;
@@ -955,6 +1023,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
 
         StopPlaybackNow(resumeRecording: false);
         ReplayData pendingReplay = CloneReplay(replay)!;
+        RepairLegacyStartTile(pendingReplay);
         lock (_stateLock)
         {
             ClearResultAttemptLocked();
@@ -1987,9 +2056,11 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             }
             if (_identityStableTicks < StableIdentityTicksRequired)
                 return;
+            // 起始砖在 QueueAttemptStart 时就已按 GCS.checkpointNum 解析过，这里沿用该结果，
+            // 避免等待关卡身份稳定的这段时间里 checkpointNum 变化导致起点漂移。
             startTile = _pendingAttemptStartTile >= 0
                 ? _pendingAttemptStartTile
-                : game.GetCurrentSequence(controller);
+                : ResolveAttemptStartTile(game, controller, -1);
             _pendingAttemptController = 0;
             _pendingAttemptStartTile = -1;
             _pendingIdentity = null;
@@ -1998,8 +2069,30 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
         BeginAttempt(controller, startTile, identity);
     }
 
+    /// <summary>
+    /// 解析本局录制真正的起始砖。
+    /// 游戏里权威来源是 <c>GCS.checkpointNum</c>：<c>Start_Rewind</c> 常规路径的参数是 <c>-1</c>
+    /// （表示“沿用当前 checkpointNum”），因此不能直接把该参数当成起点，否则从检查点续关的录制
+    /// 会被记成 <c>StartTile = 0</c>，既让“从第一砖通关才保存”的策略误触发，也让回放从头播放。
+    /// </summary>
+    private int ResolveAttemptStartTile(GameApi game, nint controller, int requestedStartTile)
+    {
+        int checkpoint = game.GetCheckpoint();
+        if (checkpoint > 0)
+            return checkpoint;
+        if (requestedStartTile > 0)
+            return requestedStartTile;
+        int currentSequence = game.GetCurrentSequence(controller);
+        return currentSequence > 0 ? currentSequence : 0;
+    }
+
     private void QueueAttemptStart(nint controller, int startTile)
     {
+        // 起始砖在这里就地解析：此时 Start_Rewind 的原函数已经跑完，GCS.checkpointNum 与
+        // 本局真实起点一致（PC 版同样在 Start_Rewind 的 postfix 里读取该字段）。
+        int resolved = _game is { } game
+            ? ResolveAttemptStartTile(game, controller, startTile)
+            : Math.Max(0, startTile);
         lock (_stateLock)
         {
             if (_activeReplay != null || _pendingReplay != null)
@@ -2007,7 +2100,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             _currentAttempt = null;
             _recording = false;
             _pendingAttemptController = controller;
-            _pendingAttemptStartTile = Math.Max(0, startTile);
+            _pendingAttemptStartTile = resolved;
             _pendingIdentity = null;
             _identityStableTicks = 0;
         }
