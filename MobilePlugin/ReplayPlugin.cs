@@ -1912,7 +1912,12 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
         string progress = replay == null
             ? $"{count} {ui.Hits}"
             : $"{count}/{replay.Hits.Count} {ui.Hits}";
-        string song = includeSong && data != null ? $"  {data.SongName}" : "";
+        // 谱面标题里常带 Unity 富文本标签（例如 `비밀 인형극 II</color>`）和换行，
+        // 直接画出来会把标签当成正文显示。这里和回放管理器使用同一套清洗规则，
+        // 保证录制中／回放中的 HUD 只显示纯文本歌曲名。
+        string cleanedSong = includeSong && data != null ? CleanManagerText(data.SongName) : "";
+        // 标题被标签占满时清洗结果可能为空，此时不要留下多余的空格。
+        string song = string.IsNullOrEmpty(cleanedSong) ? "" : $"  {cleanedSong}";
         return $"{prefix}  {progress}{song}";
     }
 
