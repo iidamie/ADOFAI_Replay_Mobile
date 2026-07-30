@@ -124,8 +124,8 @@ internal sealed class GameApi
     private readonly nint _enterLevelMethodInfo;
     private readonly PortalTravelActionDelegate? _portalTravelAction;
     private readonly nint _portalTravelActionMethodInfo;
-    private readonly QuitToMainMenuDelegate? _quitToMainMenu;
-    private readonly nint _quitToMainMenuMethodInfo;
+    private readonly QuitPortalDelegate? _quitPortal;
+    private readonly nint _quitPortalMethodInfo;
     private readonly EnterCategoryDelegate? _customLevelSelectEnterCategory;
     private readonly nint _customLevelSelectEnterCategoryMethodInfo;
     private readonly IRuntimeMethod? _customLevelSelectEnterLevel;
@@ -321,13 +321,13 @@ internal sealed class GameApi
             _portalTravelActionMethodInfo = portalTravelActionMethod.Ptr;
         }
 
-        IRuntimeMethod? quitToMainMenuMethod = _controllerClass.GetMethod("QuitToMainMenu", 0);
-        nint quitToMainMenuPointer = quitToMainMenuMethod?.FunctionPtr ?? 0;
-        if (quitToMainMenuMethod != null && quitToMainMenuPointer != 0)
+        IRuntimeMethod? quitPortalMethod = _customLevelSelectClass?.GetMethod("QuitPortal", 0);
+        nint quitPortalPointer = quitPortalMethod?.FunctionPtr ?? 0;
+        if (quitPortalMethod != null && quitPortalPointer != 0)
         {
-            _quitToMainMenu = Marshal.GetDelegateForFunctionPointer<QuitToMainMenuDelegate>(
-                quitToMainMenuPointer);
-            _quitToMainMenuMethodInfo = quitToMainMenuMethod.Ptr;
+            _quitPortal = Marshal.GetDelegateForFunctionPointer<QuitPortalDelegate>(
+                quitPortalPointer);
+            _quitPortalMethodInfo = quitPortalMethod.Ptr;
         }
 
         IRuntimeMethod? enterCategoryMethod = _customLevelSelectClass?.GetMethod("EnterCategory", 1);
@@ -923,19 +923,20 @@ internal sealed class GameApi
                     return FailLoad("回放缺少可加载的官方关卡 ID，请先打开对应谱面后回放。");
                 if (_enterLevel == null)
                     return FailLoad("当前游戏版本没有官方关卡加载接口。");
-                // scrController.EnterLevel 会经 StartLoadingScene -> scrLoader.LoadSceneWithTransition
-                // 完成转场。自定义关卡界面（scnCLS）里的 scrController / scrLoader 不是游戏场景那一套
-                // 实例，从这里直接调用会在原生转场链上崩溃；游戏自己也只从开始岛和传送门进入官方关卡。
-                // 所以先用游戏自带的 QuitToMainMenu 退回开始岛（customLevelPaths 为 null 时它会把
-                // sceneToLoad 设为关卡选择场景），等回到开始岛后再由状态机调用 EnterLevel。
+                // scrController.EnterLevel 在 scnCLS 里可能因控制器状态不一致而闪退。
+                // 调用游戏自带的 scnCLS.QuitPortal()：它会在 managed 代码里清空
+                // GCS.customLevelPaths，然后调 QuitToMainMenu——这样一定会进入开始岛分支，
+                // 不会意外重载 scnCLS 自身。
                 if (IsCustomLevelSelect())
                 {
-                    if (_quitToMainMenu == null)
+                    nint cls = InvokeStaticObject(_getCustomLevelSelect);
+                    if (cls == 0 || _quitPortal == null)
                         return FailLoad("当前游戏版本没有返回开始岛的接口。");
-                    Write(_customLevelPaths, 0, nint.Zero);
                     WaitingForLevelSelect = true;
-                    LastLoadRoute = "scrController.QuitToMainMenu -> scrController.EnterLevel";
-                    _quitToMainMenu(controller, _quitToMainMenuMethodInfo);
+                    LastLoadRoute = "scnCLS.QuitPortal -> scrController.EnterLevel";
+                    _quitPortal(cls, _quitPortalMethodInfo);
+                    if (!WaitingForLevelSelect)
+                        return false;
                     if (HasTargetScene(customLevel: false))
                         return true;
                     WaitingForLevelSelect = false;
@@ -1667,7 +1668,7 @@ internal sealed class GameApi
     private delegate void PortalTravelActionDelegate(nint instance, int destination, nint methodInfo);
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-    private delegate void QuitToMainMenuDelegate(nint instance, nint methodInfo);
+    private delegate void QuitPortalDelegate(nint instance, nint methodInfo);
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     private delegate void EnterCategoryDelegate(nint instance, int category, nint methodInfo);

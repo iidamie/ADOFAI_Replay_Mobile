@@ -4,7 +4,7 @@
     <TargetFramework>net10.0</TargetFramework>
     <AssemblyName>Replay</AssemblyName>
     <RootNamespace>Replay.Mobile</RootNamespace>
-    <Version>1.4.2-mobile.28</Version>
+    <Version>1.4.2-mobile.29</Version>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
