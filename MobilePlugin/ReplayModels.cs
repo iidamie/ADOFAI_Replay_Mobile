@@ -89,6 +89,7 @@ internal enum ReplayLoadStage
 {
     None,
     WaitingForCustomLevelBrowser,
+    WaitingForLevelSelect,
     WaitingForTargetStart,
 }
 

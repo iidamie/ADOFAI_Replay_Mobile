@@ -527,22 +527,29 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
         GameApi? game = _game;
         ReplayData? replay;
         DateTime deadline;
+        ReplayLoadStage stage;
         lock (_stateLock)
         {
-            if (_loadStage != ReplayLoadStage.WaitingForCustomLevelBrowser
-                || _pendingReplay == null)
+            if (_pendingReplay == null
+                || _loadStage is not (ReplayLoadStage.WaitingForCustomLevelBrowser
+                    or ReplayLoadStage.WaitingForLevelSelect))
                 return;
             replay = _pendingReplay;
             deadline = _loadDeadlineUtc;
+            stage = _loadStage;
         }
 
         if (deadline != default && DateTime.UtcNow >= deadline)
         {
-            FailPendingReplayLoad("等待游戏扫描自定义关卡列表超时，请确认谱面仍位于游戏的 Levels 目录中。");
+            FailPendingReplayLoad(stage == ReplayLoadStage.WaitingForLevelSelect
+                ? "等待游戏返回开始岛超时，请手动回到开始岛后重试。"
+                : "等待游戏扫描自定义关卡列表超时，请确认谱面仍位于游戏的 Levels 目录中。");
             return;
         }
 
-        CustomReplayLoadStatus status = game?.AdvanceCustomReplayLoad(replay)
+        CustomReplayLoadStatus status = (stage == ReplayLoadStage.WaitingForLevelSelect
+                ? game?.AdvanceOfficialReplayLoad(replay)
+                : game?.AdvanceCustomReplayLoad(replay))
             ?? CustomReplayLoadStatus.Failed;
         if (status == CustomReplayLoadStatus.Waiting)
             return;
@@ -1064,7 +1071,9 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             if (ReferenceEquals(_pendingReplay, pendingReplay))
                 _loadStage = game.WaitingForCustomLevelBrowser
                     ? ReplayLoadStage.WaitingForCustomLevelBrowser
-                    : ReplayLoadStage.WaitingForTargetStart;
+                    : game.WaitingForLevelSelect
+                        ? ReplayLoadStage.WaitingForLevelSelect
+                        : ReplayLoadStage.WaitingForTargetStart;
         }
         Logger.Info(LogTag, $"Replay load requested via {game.LastLoadRoute}: {game.GetReplayLoadState()}");
     }

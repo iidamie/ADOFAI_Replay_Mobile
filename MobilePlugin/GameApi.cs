@@ -124,6 +124,8 @@ internal sealed class GameApi
     private readonly nint _enterLevelMethodInfo;
     private readonly PortalTravelActionDelegate? _portalTravelAction;
     private readonly nint _portalTravelActionMethodInfo;
+    private readonly QuitToMainMenuDelegate? _quitToMainMenu;
+    private readonly nint _quitToMainMenuMethodInfo;
     private readonly EnterCategoryDelegate? _customLevelSelectEnterCategory;
     private readonly nint _customLevelSelectEnterCategoryMethodInfo;
     private readonly IRuntimeMethod? _customLevelSelectEnterLevel;
@@ -161,6 +163,12 @@ internal sealed class GameApi
     internal string LastLoadError { get; private set; } = "";
     internal string LastLoadRoute { get; private set; } = "";
     internal bool WaitingForCustomLevelBrowser { get; private set; }
+
+    /// <summary>
+    /// 官方关卡回放正在等待游戏从自定义关卡界面退回开始岛。
+    /// 回到开始岛后才能安全调用 <c>scrController.EnterLevel</c>。
+    /// </summary>
+    internal bool WaitingForLevelSelect { get; private set; }
     internal bool CanLoadScenes => _portalTravelAction != null
         && _getCustomLevelSelect != null
         && _customLevelSelectEnterLevel != null;
@@ -313,6 +321,15 @@ internal sealed class GameApi
             _portalTravelActionMethodInfo = portalTravelActionMethod.Ptr;
         }
 
+        IRuntimeMethod? quitToMainMenuMethod = _controllerClass.GetMethod("QuitToMainMenu", 0);
+        nint quitToMainMenuPointer = quitToMainMenuMethod?.FunctionPtr ?? 0;
+        if (quitToMainMenuMethod != null && quitToMainMenuPointer != 0)
+        {
+            _quitToMainMenu = Marshal.GetDelegateForFunctionPointer<QuitToMainMenuDelegate>(
+                quitToMainMenuPointer);
+            _quitToMainMenuMethodInfo = quitToMainMenuMethod.Ptr;
+        }
+
         IRuntimeMethod? enterCategoryMethod = _customLevelSelectClass?.GetMethod("EnterCategory", 1);
         nint enterCategoryPointer = enterCategoryMethod?.FunctionPtr ?? 0;
         if (enterCategoryMethod != null && enterCategoryPointer != 0)
@@ -428,8 +445,11 @@ internal sealed class GameApi
         string sceneName = InvokeStaticString(_getSceneName);
         if (!string.IsNullOrWhiteSpace(sceneName))
         {
+            // GCNS.sceneLevelSelect 在手机菜单模式下是 scnMobileMenu，其余情况是 scnLevelSelect。
+            // 两者都是可以安全调用 scrController.EnterLevel 的开始岛场景。
             return string.Equals(sceneName, "scnLevelSelect", StringComparison.OrdinalIgnoreCase)
-                || string.Equals(sceneName, "scnLevelSelectBase", StringComparison.OrdinalIgnoreCase);
+                || string.Equals(sceneName, "scnLevelSelectBase", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(sceneName, "scnMobileMenu", StringComparison.OrdinalIgnoreCase);
         }
         nint controller = GetController();
         if (IsGameWorld(controller))
@@ -903,6 +923,24 @@ internal sealed class GameApi
                     return FailLoad("回放缺少可加载的官方关卡 ID，请先打开对应谱面后回放。");
                 if (_enterLevel == null)
                     return FailLoad("当前游戏版本没有官方关卡加载接口。");
+                // scrController.EnterLevel 会经 StartLoadingScene -> scrLoader.LoadSceneWithTransition
+                // 完成转场。自定义关卡界面（scnCLS）里的 scrController / scrLoader 不是游戏场景那一套
+                // 实例，从这里直接调用会在原生转场链上崩溃；游戏自己也只从开始岛和传送门进入官方关卡。
+                // 所以先用游戏自带的 QuitToMainMenu 退回开始岛（customLevelPaths 为 null 时它会把
+                // sceneToLoad 设为关卡选择场景），等回到开始岛后再由状态机调用 EnterLevel。
+                if (IsCustomLevelSelect())
+                {
+                    if (_quitToMainMenu == null)
+                        return FailLoad("当前游戏版本没有返回开始岛的接口。");
+                    Write(_customLevelPaths, 0, nint.Zero);
+                    WaitingForLevelSelect = true;
+                    LastLoadRoute = "scrController.QuitToMainMenu -> scrController.EnterLevel";
+                    _quitToMainMenu(controller, _quitToMainMenuMethodInfo);
+                    if (HasTargetScene(customLevel: false))
+                        return true;
+                    WaitingForLevelSelect = false;
+                    return FailLoad("游戏没有建立返回开始岛的转场请求。");
+                }
                 RuntimeString level = RuntimeString.New(_domain, levelId);
                 if (!level.IsValid)
                     return FailLoad("无法创建官方关卡 ID。");
@@ -1015,10 +1053,58 @@ internal sealed class GameApi
         return CustomReplayLoadStatus.Started;
     }
 
+    /// <summary>
+    /// 官方关卡回放的第二阶段：等游戏真正回到开始岛后再调用 <c>scrController.EnterLevel</c>。
+    /// 直接在 scnCLS 里调用会因 scrController / scrLoader 不是游戏场景实例而崩溃。
+    /// </summary>
+    internal CustomReplayLoadStatus AdvanceOfficialReplayLoad(ReplayData replay)
+    {
+        if (!WaitingForLevelSelect)
+            return CustomReplayLoadStatus.Started;
+        if (IsCustomLevelSelect() || !IsLevelSelect())
+            return CustomReplayLoadStatus.Waiting;
+
+        nint controller = GetController();
+        if (controller == 0)
+            return CustomReplayLoadStatus.Waiting;
+        // 转场尚未结束时不要插入新的加载请求。
+        if (IsLevelTransitioning(controller))
+            return CustomReplayLoadStatus.Waiting;
+        if (_enterLevel == null)
+            return FailOfficialReplayLoad("当前游戏版本没有官方关卡加载接口。");
+
+        string levelId = GetReplayLevelId(replay);
+        if (!IsLoadableOfficialLevelId(levelId))
+            return FailOfficialReplayLoad("回放缺少可加载的官方关卡 ID，请先打开对应谱面后回放。");
+        RuntimeString level = RuntimeString.New(_domain, levelId);
+        if (!level.IsValid)
+            return FailOfficialReplayLoad("无法创建官方关卡 ID。");
+
+        ApplyReplayGlobals(replay);
+        ResetLevelDestination();
+        _enterLevel(controller, level.Ptr, 0, _enterLevelMethodInfo);
+        ApplyReplayGlobals(replay);
+        if (!HasTargetScene(customLevel: false))
+            return FailOfficialReplayLoad("官方关卡加载接口没有设置目标场景。");
+
+        WaitingForLevelSelect = false;
+        LastLoadRoute = "scrController.QuitToMainMenu -> scrController.EnterLevel";
+        Logger.Info("Replay", $"Official replay entry selected from level select: level='{levelId}'");
+        return CustomReplayLoadStatus.Started;
+    }
+
     internal void CancelPendingCustomReplayLoad()
     {
         WaitingForCustomLevelBrowser = false;
+        WaitingForLevelSelect = false;
         _customCategoryRequested = false;
+    }
+
+    private CustomReplayLoadStatus FailOfficialReplayLoad(string message)
+    {
+        CancelPendingCustomReplayLoad();
+        LastLoadError = message;
+        return CustomReplayLoadStatus.Failed;
     }
 
     private CustomReplayLoadStatus FailCustomReplayLoad(string message)
@@ -1052,6 +1138,7 @@ internal sealed class GameApi
             + $"customIndex={Read(_customLevelIndex, 0, 0)}, "
             + $"customId='{ReadString(_customLevelId, 0)}', "
             + $"browserPending={WaitingForCustomLevelBrowser}, "
+            + $"levelSelectPending={WaitingForLevelSelect}, "
             + $"transitioning={Read(_controllerTransitioningLevel, GetController(), (byte)0) != 0}";
     }
 
@@ -1578,6 +1665,9 @@ internal sealed class GameApi
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     private delegate void PortalTravelActionDelegate(nint instance, int destination, nint methodInfo);
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    private delegate void QuitToMainMenuDelegate(nint instance, nint methodInfo);
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     private delegate void EnterCategoryDelegate(nint instance, int category, nint methodInfo);

@@ -11,6 +11,7 @@
 - 从原始起点或检查点重载关卡，并屏蔽真实触摸后注入记录的判定
 - 回放会在 `scrController.Awake` 清空 `GCS.checkpointNum` 后把起始砖写回，因此从检查点录制的回放会从中间开始播放，而不是从头
 - 跨自定义谱面回放先通过 `PortalTravelAction(CustomLevelsScene)` 进入游戏原生自定义关卡界面，等待 `scnCLS` 扫描完成后调用其 `EnterLevel`；由游戏按正常游玩记录执行 `LoadCustomWorld`，Mod 不再从主界面直接调用 `LoadCustomLevel` 或 `scnGame.LoadAndPlayLevel`
+- 在自定义关卡界面（`scnCLS`）里播放官方谱面回放时，先用游戏自带的 `QuitToMainMenu` 退回开始岛，等场景就绪后再调用 `EnterLevel`；该界面的 `scrController` / `scrLoader` 不是游戏场景实例，直接调用会在原生转场链上闪退
 - ImGui 入口只提交命令，暂停、恢复和谱面加载都在 `scrController.Update` 所在的游戏主线程执行
 - 通过控制器状态检测谱面转场，不占用 `scrController.StartLoadingScene` Hook，可与 ShowBPM 同时启用
 - 使用新版 StArray.ModManager 的 `[UnmanagedHook]` Source Generator 安装和卸载游戏 Hook，不再手工维护 Dobby trampoline
