@@ -47,6 +47,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
     private bool _levelTransitionInProgress;
     private bool _editorPlayRequested;
     private bool _editorFinalized;
+    private bool _editorHooksInstalled;
     private bool _renderErrorLogged;
     private bool _managerOpen;
     private bool _managerShowingDetails;
@@ -145,7 +146,6 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             throw new InvalidOperationException("Required Replay IL2CPP hooks could not be installed");
         }
         CustomLoadDiagnostics.Install(this);
-        EditorSupport.Install(this);
 
         RefreshFiles();
         nint controller = _game.GetController();
@@ -165,7 +165,11 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
         catch
         {
         }
-        EditorSupport.Uninstall();
+        if (_editorHooksInstalled)
+        {
+            EditorSupport.Uninstall();
+            _editorHooksInstalled = false;
+        }
         CustomLoadDiagnostics.Uninstall();
         GameHooks.Uninstall();
         lock (_stateLock)
@@ -550,9 +554,27 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
         }
         Logger.Info(LogTag, "Editor reset — cleared editor play state");
     }
+    private void UpdateEditorHooks()
+    {
+        bool inEditor = _game?.IsEditorScene() == true;
+        if (inEditor && !_editorHooksInstalled)
+        {
+            EditorSupport.Install(this);
+            _editorHooksInstalled = true;
+            Logger.Info(LogTag, "Editor hooks installed (entered editor scene)");
+        }
+        else if (!inEditor && _editorHooksInstalled)
+        {
+            EditorSupport.Uninstall();
+            _editorHooksInstalled = false;
+            Logger.Info(LogTag, "Editor hooks uninstalled (left editor scene)");
+        }
+    }
+
 
     internal void TickMainThread(nint controller)
     {
+        UpdateEditorHooks();
         DetectLevelTransition(controller);
         if (controller != 0)
             _controller = controller;
