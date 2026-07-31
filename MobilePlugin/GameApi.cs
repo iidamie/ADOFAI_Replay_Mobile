@@ -23,6 +23,7 @@ internal sealed class GameApi
     private readonly IRuntimeClass? _levelMakerClass;
     private readonly IRuntimeClass? _failBarClass;
     private readonly IRuntimeClass? _adoBaseClass;
+    private readonly IRuntimeClass? _editorClass;
     private readonly IRuntimeClass? _gameClass;
     private readonly IRuntimeClass? _levelDataClass;
     private readonly IRuntimeClass? _levelSelectClass;
@@ -70,6 +71,7 @@ internal sealed class GameApi
     private readonly IRuntimeField? _conductorBpm;
     private readonly IRuntimeField? _conductorSong;
     private readonly IRuntimeField? _conductorInstance;
+    private readonly IRuntimeField? _conductorHasSongStarted;
 
     private readonly IRuntimeField? _gameInstance;
     private readonly IRuntimeField? _gameLevelPath;
@@ -98,6 +100,9 @@ internal sealed class GameApi
     private readonly IRuntimeField? _textValue;
 
     private readonly IRuntimeMethod? _getController;
+    private readonly IRuntimeMethod? _getEditor;
+    private readonly IRuntimeMethod? _getEditorPlayMode;
+    private readonly IRuntimeMethod? _getEditorFloors;
     private readonly IRuntimeMethod? _getPlayerOne;
     private readonly IRuntimeMethod? _getConductor;
     private readonly IRuntimeMethod? _getConductorInstance;
@@ -113,6 +118,12 @@ internal sealed class GameApi
     private readonly IRuntimeMethod? _getPlayerAuto;
     private readonly IRuntimeMethod? _getLevelArtist;
     private readonly IRuntimeMethod? _getLevelSong;
+    private readonly EditorDeselectFloorsDelegate? _editorDeselectFloors;
+    private readonly nint _editorDeselectFloorsMethodInfo;
+    private readonly EditorVoidDelegate? _editorDeselectDecorations;
+    private readonly nint _editorDeselectDecorationsMethodInfo;
+    private readonly EditorSelectFloorDelegate? _editorSelectFloor;
+    private readonly nint _editorSelectFloorMethodInfo;
 
     private readonly RestartDelegate? _restart;
     private readonly nint _restartMethodInfo;
@@ -188,6 +199,7 @@ internal sealed class GameApi
         _levelMakerClass = FindClass("", "scrLevelMaker");
         _failBarClass = FindClass("", "scrFailBar");
         _adoBaseClass = FindClass("", "ADOBase");
+        _editorClass = FindClass("", "scnEditor");
         _gameClass = FindClass("", "scnGame");
         _levelDataClass = FindClass("ADOFAI", "LevelData");
         _levelSelectClass = FindClass("", "scnLevelSelect");
@@ -235,6 +247,7 @@ internal sealed class GameApi
         _conductorBpm = FindField(_conductorClass, "bpm");
         _conductorSong = FindField(_conductorClass, "song");
         _conductorInstance = FindField(_conductorClass, "_instance", "instance");
+        _conductorHasSongStarted = FindField(_conductorClass, "hasSongStarted");
 
         _gameInstance = FindField(_gameClass, "instance", "_instance");
         _gameLevelPath = FindField(_gameClass, "levelPath");
@@ -263,6 +276,9 @@ internal sealed class GameApi
 
         _getController = _adoBaseClass?.GetMethod("get_controller", 0)
             ?? _controllerClass.GetMethod("get_instance", 0);
+        _getEditor = _adoBaseClass?.GetMethod("get_editor", 0);
+        _getEditorPlayMode = _editorClass?.GetMethod("get_playMode", 0);
+        _getEditorFloors = _editorClass?.GetMethod("get_floors", 0);
         _getPlayerOne = _controllerClass.GetMethod("get_playerOne", 0);
         _getConductor = _adoBaseClass?.GetMethod("get_conductor", 0);
         _getConductorInstance = _conductorClass.GetMethod("get_instance", 0);
@@ -279,6 +295,16 @@ internal sealed class GameApi
         _getPlayerAuto = _playerClass.GetMethod("get_auto", 0);
         _getLevelArtist = _levelDataClass?.GetMethod("get_artist", 0);
         _getLevelSong = _levelDataClass?.GetMethod("get_song", 0);
+
+        _editorDeselectFloors = Bind<EditorDeselectFloorsDelegate>(
+            _editorClass, "DeselectFloors", new[] { "System.Boolean" },
+            out _editorDeselectFloorsMethodInfo);
+        _editorDeselectDecorations = Bind<EditorVoidDelegate>(
+            _editorClass, "DeselectAllDecorations", Array.Empty<string>(),
+            out _editorDeselectDecorationsMethodInfo);
+        _editorSelectFloor = Bind<EditorSelectFloorDelegate>(
+            _editorClass, "SelectFloor", new[] { "scrFloor", "System.Boolean" },
+            out _editorSelectFloorMethodInfo);
 
         IRuntimeMethod? restartMethod = _controllerClass.GetMethod("Restart", 1);
         nint restartPointer = restartMethod?.FunctionPtr ?? 0;
@@ -389,6 +415,81 @@ internal sealed class GameApi
         return controller != 0 ? controller : Read(_controllerInstance, 0, nint.Zero);
     }
 
+    internal nint GetEditor()
+    {
+        return InvokeStaticObject(_getEditor);
+    }
+
+    internal bool IsEditorScene()
+    {
+        return string.Equals(GetSceneName(), "scnEditor", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// 使用游戏自己的 scnEditor.playMode 判定编辑器当前是在预览还是游玩。
+    /// scrController.gameworld 在编辑器预览页同样为 true，不能用来区分。
+    /// </summary>
+    internal bool IsEditorPlayMode()
+    {
+        nint editor = GetEditor();
+        if (editor == 0 || _getEditorPlayMode == null)
+            return false;
+        try
+        {
+            return _getEditorPlayMode.InvokeUnbox<byte>(editor) != 0;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// 在用户自己点击编辑器 Play 后、scnEditor.Play 原函数运行前，
+    /// 把编辑器选择同步到回放起点。Play 会先根据选中砖构建行星和关卡状态，
+    /// 因此只在稍后的 Start_Rewind 改参数已经来不及。
+    /// </summary>
+    internal bool PrepareEditorReplayStart(nint editor, int startTile)
+    {
+        if (editor == 0
+            || _editorDeselectFloors == null
+            || _editorDeselectDecorations == null)
+            return false;
+        try
+        {
+            // 先清除装饰选择，否则 Play 会从 lastSelectedFloor 启动。
+            _editorDeselectDecorations(editor, _editorDeselectDecorationsMethodInfo);
+            if (startTile <= 0)
+            {
+                _editorDeselectFloors(editor, 0, _editorDeselectFloorsMethodInfo);
+                return true;
+            }
+
+            if (_getEditorFloors == null || _editorSelectFloor == null)
+                return false;
+            nint floors = _getEditorFloors.Invoke(editor);
+            if (floors == 0)
+                return false;
+            nint target = 0;
+            foreach (RuntimeObject item in new UnmanagedEnumerable(floors))
+            {
+                if (item.Ptr != 0 && GetFloorSequence(item.Ptr) == startTile)
+                {
+                    target = item.Ptr;
+                    break;
+                }
+            }
+            if (target == 0)
+                return false;
+            _editorSelectFloor(editor, target, 0, _editorSelectFloorMethodInfo);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
     internal nint GetPlayer(nint controller)
     {
         if (controller == 0)
@@ -407,6 +508,12 @@ internal sealed class GameApi
     {
         nint conductor = InvokeStaticObject(_getConductor);
         return conductor != 0 ? conductor : Read(_conductorInstance, 0, nint.Zero);
+    }
+
+    internal bool HasSongStarted()
+    {
+        nint conductor = GetConductor();
+        return conductor != 0 && Read(_conductorHasSongStarted, conductor, (byte)0) != 0;
     }
 
     internal nint GetChosenPlanet(nint player)
@@ -604,9 +711,18 @@ internal sealed class GameApi
         out ReplayLevelIdentity? identity,
         out string reason)
     {
+        return TryGetLevelIdentity(controller, out identity, out reason, false);
+    }
+
+    internal bool TryGetLevelIdentity(
+        nint controller,
+        out ReplayLevelIdentity? identity,
+        out string reason,
+        bool skipGameWorldCheck)
+    {
         identity = null;
         reason = "";
-        if (!IsGameWorld(controller))
+        if (!skipGameWorldCheck && !IsGameWorld(controller))
             return false;
         if (Read(_controllerSetupComplete, controller, (byte)1) == 0)
         {
@@ -652,13 +768,37 @@ internal sealed class GameApi
         string levelPath = ReadString(_gameLevelPath, game);
         if (game == 0 || levelData == 0 || Read(_gameIsLoading, game, (byte)0) != 0)
         {
+            // 编辑器模式下 scnGame.instance 为空，从 LevelMaker 和控制器取数据。
+            if (skipGameWorldCheck)
+            {
+                if (string.IsNullOrWhiteSpace(songName))
+                {
+                    reason = "editor song name is not ready";
+                    return false;
+                }
+                identity = new ReplayLevelIdentity(
+                    songName,
+                    GetArtistName(),
+                    "",
+                    GetSceneName(),
+                    $"editor:{songName}:{totalTiles}",
+                    false,
+                    totalTiles);
+                return true;
+            }
             reason = "custom level data is not ready";
             return false;
         }
         if (string.IsNullOrWhiteSpace(levelPath) || !File.Exists(levelPath))
         {
-            reason = "custom level path is not ready";
-            return false;
+            // 编辑器模式下谱面可能在内存中，没有磁盘文件路径。
+            if (skipGameWorldCheck)
+                levelPath = "";
+            else
+            {
+                reason = "custom level path is not ready";
+                return false;
+            }
         }
         if (string.IsNullOrWhiteSpace(songName))
         {
@@ -681,6 +821,7 @@ internal sealed class GameApi
         return true;
     }
 
+    /// <summary>
     internal int GetFloorSequence(nint floor)
     {
         return Read(_floorSequence, floor, 0);
@@ -954,6 +1095,14 @@ internal sealed class GameApi
                     || FailLoad("官方关卡加载接口没有设置目标场景。");
             }
 
+            // 编辑器回放：没有磁盘文件，也不主动调用 Play。
+            // 只设置 GCS.checkpointNum 等回放元数据，等用户自己按 Play 后走 Start_Rewind 激活。
+            if (replay.SceneName == "scnEditor" && string.IsNullOrWhiteSpace(replay.LevelPath))
+            {
+                ApplyReplayGlobals(replay);
+                LastLoadRoute = "PendingEditorPlay";
+                return true;
+            }
             if (string.IsNullOrWhiteSpace(replay.LevelPath) || !File.Exists(replay.LevelPath))
                 return FailLoad("找不到回放对应的自定义谱面文件。");
             if (!CustomLevelMatchesReplay(replay.LevelPath, replay.SongName, out string actualSong))
@@ -1672,6 +1821,16 @@ internal sealed class GameApi
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     private delegate void EnterCategoryDelegate(nint instance, int category, nint methodInfo);
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    private delegate void EditorVoidDelegate(nint instance, nint methodInfo);
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    private delegate void EditorDeselectFloorsDelegate(nint instance, byte saveState, nint methodInfo);
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    private delegate void EditorSelectFloorDelegate(
+        nint instance, nint floor, byte moveCamera, nint methodInfo);
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     private delegate nint FindObjectDelegate(nint name, nint methodInfo);

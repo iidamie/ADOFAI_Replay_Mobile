@@ -45,6 +45,8 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
     private string _pendingDeletePath = "";
     private bool _recording;
     private bool _levelTransitionInProgress;
+    private bool _editorPlayRequested;
+    private bool _editorFinalized;
     private bool _renderErrorLogged;
     private bool _managerOpen;
     private bool _managerShowingDetails;
@@ -143,6 +145,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             throw new InvalidOperationException("Required Replay IL2CPP hooks could not be installed");
         }
         CustomLoadDiagnostics.Install(this);
+        EditorSupport.Install(this);
 
         RefreshFiles();
         nint controller = _game.GetController();
@@ -162,6 +165,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
         catch
         {
         }
+        EditorSupport.Uninstall();
         CustomLoadDiagnostics.Uninstall();
         GameHooks.Uninstall();
         lock (_stateLock)
@@ -178,6 +182,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             _pendingIdentity = null;
             _identityStableTicks = 0;
             _levelTransitionInProgress = false;
+            _editorPlayRequested = false;
             _runState = ReplayRunState.Idle;
             _loadStage = ReplayLoadStage.None;
             _loadDeadlineUtc = default;
@@ -418,6 +423,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
 
         _controller = controller;
         _levelTransitionInProgress = false;
+        _editorFinalized = false;
         bool activated = false;
         bool restarted = false;
 
@@ -480,6 +486,69 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
         }
         if (discarded is { Hits.Count: > 0 })
             Logger.Info(LogTag, $"Discarded unfinished recording during level transition: {discarded.SongName}");
+    }
+
+    internal void HandleEditorPlay(nint editorInstance)
+    {
+        int replayStartTile = -1;
+        lock (_stateLock)
+        {
+            if (IsEditorReplay(_pendingReplay)
+                && _loadStage == ReplayLoadStage.WaitingForTargetStart)
+                replayStartTile = _pendingReplay!.StartTile;
+            _editorPlayRequested = true;
+            _editorFinalized = false;
+            // Break the _levelTransitionInProgress deadlock in case the editor
+            // caused a controller change but never calls Start_Rewind.
+            _levelTransitionInProgress = false;
+            // Abandon any stale attempt data so a fresh recording starts cleanly.
+            _currentAttempt = null;
+            _recording = false;
+            _pendingAttemptController = 0;
+            _pendingAttemptStartTile = -1;
+            _pendingIdentity = null;
+            _identityStableTicks = 0;
+        }
+        if (replayStartTile >= 0)
+        {
+            bool prepared = _game?.PrepareEditorReplayStart(editorInstance, replayStartTile) == true;
+            Logger.Info(
+                LogTag,
+                prepared
+                    ? $"Prepared editor replay start at tile {replayStartTile}"
+                    : $"Could not prepare editor replay start at tile {replayStartTile}");
+        }
+        Logger.Info(LogTag, "Editor play started — recording will begin when controller is ready");
+    }
+
+    internal void HandleEditorReset()
+    {
+        lock (_stateLock)
+        {
+            _editorPlayRequested = false;
+            _editorFinalized = false;
+            // 从编辑器游玩返回预览时，当前回放可能已经消费了一部分输入。
+            // 重新武装为待播放状态，保证下一次按 Play 必定从第 0 条开始。
+            if (_activeReplay != null
+                && _runState is ReplayRunState.WaitingForStart
+                    or ReplayRunState.Playing
+                    or ReplayRunState.Paused)
+            {
+                _pendingReplay = _activeReplay;
+                _activeReplay = null;
+                _replayIndex = 0;
+                _runState = ReplayRunState.Loading;
+                _loadStage = ReplayLoadStage.WaitingForTargetStart;
+                _loadDeadlineUtc = default;
+            }
+            _currentAttempt = null;
+            _recording = false;
+            _pendingAttemptController = 0;
+            _pendingAttemptStartTile = -1;
+            _pendingIdentity = null;
+            _identityStableTicks = 0;
+        }
+        Logger.Info(LogTag, "Editor reset — cleared editor play state");
     }
 
     internal void TickMainThread(nint controller)
@@ -630,12 +699,30 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
 
         nint controller = game.GetController();
         nint player = game.GetPlayer(controller);
-        if (!game.IsGameWorld(controller) || player == 0)
+        // 编辑器模式下 player 和 state 均不可靠，全部跳过。
+        bool editorReplay;
+        lock (_stateLock)
+            editorReplay = replay.SceneName == "scnEditor";
+        if (!game.IsGameWorld(controller))
+            return;
+        // Start_Rewind 在 scnEditor.Play() 内部触发，但编辑器预览页的 controller
+        // 也长期保持 gameworld=true。必须用游戏自己的 playMode 开闸，
+        // 避免回放尚未真正开始时提前吞掉输入。
+        if (editorReplay && !game.IsEditorPlayMode())
+            return;
+        if (!editorReplay)
+        {
+            if (player == 0) return;
+            if (game.GetControllerState(controller) != PlayerControlState) return;
+        }
+        if (game.IsPaused(controller))
             return;
         _controller = controller;
         _player = player;
-
-        if (game.GetControllerState(controller) != PlayerControlState || game.IsPaused(controller))
+        // 编辑器 currentState 始终为 None，playMode 又会在倒计时前提前为 true。
+        // hasSongStarted 由 scrConductor.Rewind 清零，并在真正调度音乐后置位，
+        // 是不会提前消费回放输入的可靠开闸信号。
+        if (editorReplay && !game.HasSongStarted())
             return;
         if (state == ReplayRunState.WaitingForStart)
         {
@@ -669,6 +756,10 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             bool midSpin = floor != 0 && game.IsMidSpin(floor);
             if (currentSequence > hit.SequenceId)
             {
+                // 编辑器回放若仍落在用户先前选中的砖，不能把记录当作过期输入
+                // 一口气丢弃；等待 Play 前置准备/Start_Rewind 把进度同步到回放起点。
+                if (editorReplay)
+                    return;
                 lock (_stateLock)
                     _replayIndex++;
                 continue;
@@ -797,16 +888,19 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             _pendingAttemptStartTile = -1;
             _pendingIdentity = null;
             _identityStableTicks = 0;
+            _editorPlayRequested = false;
+            _editorFinalized = true;
+            _managerPausedGame = false;
             _runState = ReplayRunState.Idle;
         }
         if (released)
             Logger.Info(LogTag, $"Replay state released after {result}");
     }
 
-    private void BeginAttempt(nint controller, int startTile, ReplayLevelIdentity identity)
+    private void BeginAttempt(nint controller, int startTile, ReplayLevelIdentity identity, bool forceStart = false)
     {
         GameApi? game = _game;
-        if (game == null || !game.IsGameWorld(controller))
+        if (game == null || (!forceStart && !game.IsGameWorld(controller)))
             return;
         nint player = game.GetPlayer(controller);
         if (player == 0 || _ignoreAutoplay && game.IsPlayerAuto(player))
@@ -870,6 +964,9 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             finalized = CloneReplay(_lastAttempt);
             _currentAttempt = null;
             _recording = false;
+            // 编辑器模式下暂停自动录制，等下次 Start_Rewind 触发再恢复。
+            if (_editorPlayRequested)
+                _editorFinalized = true;
         }
         if (finalized == null)
             return null;
@@ -1042,6 +1139,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             _loadDeadlineUtc = DateTime.UtcNow.Add(CustomLevelBrowserTimeout);
             _replayIndex = 0;
             _recording = false;
+            _editorFinalized = false;
         }
         Logger.Info(
             LogTag,
@@ -1104,7 +1202,10 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
         GameApi? game = _game;
         game?.CancelPendingCustomReplayLoad();
         nint controller = game?.GetController() ?? 0;
-        if (controller != 0)
+        // 编辑器预览页的 gameworld 也是 true，而 set_paused(false) 会直接把预览页
+        // 切进游玩状态。只有非编辑器，或编辑器已经处于 Play 模式时才恢复暂停。
+        bool editorScene = game?.IsEditorScene() == true;
+        if (controller != 0 && game?.IsGameWorld(controller) == true && !editorScene)
             game?.SetPaused(controller, false);
         lock (_stateLock)
         {
@@ -1114,8 +1215,11 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             _runState = ReplayRunState.Idle;
             _loadStage = ReplayLoadStage.None;
             _loadDeadlineUtc = default;
+            _editorPlayRequested = false;
+            _editorFinalized = false;
+            _managerPausedGame = false;
         }
-        if (resumeRecording && game?.IsGameWorld(controller) == true)
+        if (resumeRecording && game?.IsGameWorld(controller) == true && !game.IsEditorScene())
             QueueAttemptStart(controller, game.GetCurrentSequence(controller));
     }
 
@@ -1183,7 +1287,10 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             if (!_managerOpen)
                 return;
         }
-        if (controller == 0 || game?.IsGameWorld(controller) != true || game.IsPaused(controller))
+        if (controller == 0
+            || game?.IsGameWorld(controller) != true
+            || game.IsPaused(controller)
+            || game.IsEditorScene())
             return;
 
         game.SetPaused(controller, true);
@@ -1202,7 +1309,9 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
     {
         GameApi? game = _game;
         nint controller = game?.GetController() ?? 0;
-        if (controller != 0)
+        if (controller != 0
+            && game?.IsGameWorld(controller) == true
+            && !game.IsEditorScene())
             game?.SetPaused(controller, false);
     }
 
@@ -1210,7 +1319,19 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
     {
         GameApi? game = _game;
         bool customLevelSelect = game?.IsCustomLevelSelect() == true;
-        bool entryScene = customLevelSelect || game?.IsLevelSelect() == true;
+        bool editorScene = !customLevelSelect && string.Equals(
+            game?.GetSceneName(), "scnEditor", StringComparison.OrdinalIgnoreCase);
+        if (editorScene && game?.IsEditorPlayMode() == true)
+        {
+            // 真正游玩时隐藏入口；失败/通关释放回放，或用户主动停止回放后，
+            // 即使编辑器尚未切回预览也重新显示，允许不重进编辑器再次选择回放。
+            lock (_stateLock)
+                editorScene = _activeReplay == null
+                    && _pendingReplay == null
+                    && !_recording
+                    && !_editorPlayRequested;
+        }
+        bool entryScene = customLevelSelect || game?.IsLevelSelect() == true || editorScene;
         if (!entryScene)
             _islandEntryLogged = false;
         long settingsAge = Environment.TickCount64 - Interlocked.Read(ref _lastSettingsGuiTick);
@@ -1230,7 +1351,10 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             + style.WindowPadding.X * 2f;
         float width = ClampOverlayWidth(display.X, margin, 180f, desiredWidth);
         Vector2 size = new(width, GetOverlayWindowHeight(buttonHeight));
-        ImGui.SetNextWindowPos(new Vector2(display.X - size.X - margin, display.Y - size.Y - margin), ImGuiCond.Always);
+        // 编辑器左上角，其余场景右下角
+        float posX = editorScene ? margin : display.X - size.X - margin;
+        float posY = editorScene ? margin : display.Y - size.Y - margin;
+        ImGui.SetNextWindowPos(new Vector2(posX, posY), ImGuiCond.Always);
         ImGui.SetNextWindowSize(size, ImGuiCond.Always);
         ImGui.SetNextWindowBgAlpha(0.88f);
         ImGuiWindowFlags flags = ImGuiWindowFlags.NoTitleBar
@@ -1249,8 +1373,8 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             _islandEntryLogged = true;
             Logger.Info(
                 LogTag,
-                customLevelSelect
-                    ? "Replay custom-level-page entry is available"
+                editorScene ? "Replay editor entry is available"
+                    : customLevelSelect ? "Replay custom-level-page entry is available"
                     : "Replay main-page entry is available");
         }
     }
@@ -2030,14 +2154,25 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
     private void EnsureAttemptStarted(nint controller)
     {
         GameApi? game = _game;
-        if (game == null || controller == 0 || !game.IsGameWorld(controller)
-            || game.GetControllerState(controller) != PlayerControlState)
+        bool editorPlay;
+        lock (_stateLock)
+            editorPlay = _editorPlayRequested;
+        // Start_Rewind 被调用过说明游戏已确认要开始游玩，不管 state 是 0 还是 4 都应该录制。
+        bool pendingStart;
+        lock (_stateLock)
+            pendingStart = _pendingAttemptController != 0;
+        if (game == null || controller == 0
+            || (!editorPlay && !game.IsGameWorld(controller))
+            || (!editorPlay && !pendingStart && game.GetControllerState(controller) != PlayerControlState))
             return;
 
         lock (_stateLock)
         {
-            if (_recording || _activeReplay != null || _pendingReplay != null || _currentAttempt != null
-                || _levelTransitionInProgress)
+            if (_recording || _activeReplay != null || _pendingReplay != null || _currentAttempt != null)
+                return;
+            if (!_editorPlayRequested && _levelTransitionInProgress)
+                return;
+            if (_editorFinalized)
                 return;
             if (_pendingAttemptController != 0 && _pendingAttemptController != controller)
             {
@@ -2047,7 +2182,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             }
         }
 
-        if (!game.TryGetLevelIdentity(controller, out ReplayLevelIdentity? identity, out _)
+        if (!game.TryGetLevelIdentity(controller, out ReplayLevelIdentity? identity, out _, editorPlay)
             || identity == null)
         {
             lock (_stateLock)
@@ -2080,7 +2215,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             _pendingIdentity = null;
             _identityStableTicks = 0;
         }
-        BeginAttempt(controller, startTile, identity);
+        BeginAttempt(controller, startTile, identity, editorPlay);
     }
 
     /// <summary>
@@ -2135,6 +2270,12 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
         _resultAttempt = null;
         _resultAttemptSaved = false;
         _resultSaveQueued = false;
+    }
+
+    private static bool IsEditorReplay(ReplayData? replay)
+    {
+        return replay != null
+            && string.Equals(replay.SceneName, "scnEditor", StringComparison.OrdinalIgnoreCase);
     }
 
     private static ReplayData? CloneReplay(ReplayData? source)
