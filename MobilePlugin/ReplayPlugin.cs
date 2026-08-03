@@ -93,7 +93,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
         string? informational = typeof(ReplayPlugin).Assembly
             .GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion;
         if (string.IsNullOrWhiteSpace(informational))
-            return typeof(ReplayPlugin).Assembly.GetName().Version?.ToString() ?? "1.4.2";
+            return typeof(ReplayPlugin).Assembly.GetName().Version?.ToString() ?? "1.5.0";
         int metadataSeparator = informational.IndexOf('+');
         return metadataSeparator < 0 ? informational : informational[..metadataSeparator];
     }
@@ -892,6 +892,14 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             SetResultAttempt(attempt, saved);
         }
         return false;
+    }
+
+    internal bool HandleCustomLevelComplete()
+    {
+        nint controller;
+        lock (_stateLock)
+            controller = _controller;
+        return HandleLevelComplete(controller);
     }
 
     internal void ReleaseReplayAfterResult(string result)

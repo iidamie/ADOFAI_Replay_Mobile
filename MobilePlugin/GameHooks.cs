@@ -340,21 +340,31 @@ public static partial class GameHooks
     [UnmanagedHook("Assembly-CSharp.dll", "scrMistakesManager", "SaveCustom", ParameterCount = 3)]
     private static EndLevelInfo SaveCustom(
         nint instance,
-        nint levelData,
-        byte save,
+        nint levelHash,
+        byte wonLevel,
         float speed,
         nint methodInfo)
     {
+        ReplayPlugin? plugin = _plugin;
+        bool replayResult = false;
         try
         {
-            if (_plugin?.IsReplayActive == true)
+            // Custom levels persist their result through SaveCustom. On some game builds this is
+            // the only reliable completion callback, so use wonLevel as an autosave fallback.
+            if (wonLevel != 0)
+                replayResult = plugin?.HandleCustomLevelComplete() == true;
+            if (replayResult || plugin?.IsReplayActive == true)
+            {
+                if (replayResult)
+                    plugin?.ReleaseReplayAfterResult("custom completion");
                 return default;
+            }
         }
         catch (Exception exception)
         {
             Logger.Error(LogTag, $"SaveCustom detour failed: {exception}");
         }
-        return SaveCustomOriginal(instance, levelData, save, speed, methodInfo);
+        return SaveCustomOriginal(instance, levelHash, wonLevel, speed, methodInfo);
     }
 
     [StructLayout(LayoutKind.Sequential)]
