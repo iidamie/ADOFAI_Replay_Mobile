@@ -7,7 +7,7 @@ namespace Replay.Mobile;
 public static partial class GameHooks
 {
     private const string LogTag = "Replay";
-    private const int HookCount = 9;
+    private const int HookCount = 10;
 
     private static ReplayPlugin? _plugin;
     private static nint _playerHitMethodInfo;
@@ -235,15 +235,26 @@ public static partial class GameHooks
         try
         {
             _plugin?.TickMainThread(instance);
-            // scrConductor.Update is also used by AsyncInput's official clock
-            // hook. Run replay timing from this already-owned controller hook
-            // so the two mods never compete for the same native address.
-            _plugin?.TickPlayback();
         }
         catch (Exception exception)
         {
             Logger.Error(LogTag, $"Controller update failed: {exception}");
         }
+    }
+
+    [UnmanagedHook("Assembly-CSharp.dll", "scrConductor", "Update", ParameterCount = 0)]
+    private static void ConductorUpdate(nint instance, nint methodInfo)
+    {
+        try
+        {
+            _plugin?.TickConductorMainThread();
+            _plugin?.TickPlayback();
+        }
+        catch (Exception exception)
+        {
+            Logger.Error(LogTag, $"Replay update failed: {exception}");
+        }
+        ConductorUpdateOriginal(instance, methodInfo);
     }
 
     [UnmanagedHook("Assembly-CSharp.dll", "scrController", "FailAction", ParameterCount = 4)]

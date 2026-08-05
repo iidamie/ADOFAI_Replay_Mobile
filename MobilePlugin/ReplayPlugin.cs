@@ -14,7 +14,6 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
     private const int PlayerControlState = 4;
     private const int StableIdentityTicksRequired = 20;
     private static readonly TimeSpan CustomLevelBrowserTimeout = TimeSpan.FromSeconds(60);
-    private static ReplayPlugin? _instance;
 
     private readonly object _stateLock = new();
     private readonly ConcurrentQueue<ReplayCommand> _commands = new();
@@ -108,28 +107,6 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
         }
     }
 
-    /// <summary>
-    /// AsyncInput 使用的无编译依赖播放态探针。
-    /// 回放期间必须关闭实时触摸，否则一笔触摸会和回放注入各消费一次。
-    /// </summary>
-    public static bool IsPlaybackActive
-    {
-        get
-        {
-            ReplayPlugin? instance = Volatile.Read(ref _instance);
-            if (instance == null)
-                return false;
-
-            lock (instance._stateLock)
-            {
-                return instance._activeReplay != null
-                    && instance._runState is ReplayRunState.WaitingForStart
-                        or ReplayRunState.Playing
-                        or ReplayRunState.Paused;
-            }
-        }
-    }
-
     internal bool IsReplayLoadPending
     {
         get
@@ -169,7 +146,6 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             throw new InvalidOperationException("Required Replay IL2CPP hooks could not be installed");
         }
         CustomLoadDiagnostics.Install(this);
-        Volatile.Write(ref _instance, this);
 
         RefreshFiles();
         nint controller = _game.GetController();
@@ -219,8 +195,6 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             _toast = "";
             _toastUntilUtc = default;
         }
-        if (ReferenceEquals(Volatile.Read(ref _instance), this))
-            Volatile.Write(ref _instance, null);
         Logger.Info(LogTag, "Unloaded");
     }
 
