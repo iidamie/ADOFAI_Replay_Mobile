@@ -1,8 +1,10 @@
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Numerics;
 using System.Reflection;
 using System.Text;
 using ImGuiNET;
+using StArray.ModManager.Android.Native;
 using StArray.ModManager.Manager;
 using StArray.ModManager.Runtime;
 
@@ -21,6 +23,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
 
     private GameApi? _game;
     private ReplayStore? _store;
+    private GitHubUpdateService? _updateService;
     private ReplayData? _currentAttempt;
     private ReplayData? _lastAttempt;
     private ReplayData? _activeReplay;
@@ -33,6 +36,11 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
     private nint _player;
     private nint _pendingAttemptController;
     private int _replayIndex;
+    private int _replayTouchIndex;
+    private long _recordingStartTicks;
+    private long _replayClockStartTicks;
+    private long _replayPausedTicks;
+    private long _replayPauseStartTicks;
     private int _pendingAttemptStartTile = -1;
     private int _identityStableTicks;
     private int _languageCode = 10;
@@ -74,6 +82,8 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
     private float _hudPositionY = 0.08f;
     private int _maximumSavedReplays = 100;
     private string _replayDirectory = "";
+    private int _inputDisplayWidth;
+    private int _inputDisplayHeight;
 
     public string Id => "Replay";
     public string Name => "ADOFAI Replay";
@@ -93,7 +103,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
         string? informational = typeof(ReplayPlugin).Assembly
             .GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion;
         if (string.IsNullOrWhiteSpace(informational))
-            return typeof(ReplayPlugin).Assembly.GetName().Version?.ToString() ?? "1.5.0";
+            return typeof(ReplayPlugin).Assembly.GetName().Version?.ToString() ?? "1.5.1";
         int metadataSeparator = informational.IndexOf('+');
         return metadataSeparator < 0 ? informational : informational[..metadataSeparator];
     }
@@ -145,7 +155,10 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             _game = null;
             throw new InvalidOperationException("Required Replay IL2CPP hooks could not be installed");
         }
+        InputEvents.OnTouch += OnTouch;
         CustomLoadDiagnostics.Install(this);
+        _updateService = new GitHubUpdateService(modDirectory, Version);
+        _updateService.StartAutomaticCheck();
 
         RefreshFiles();
         nint controller = _game.GetController();
@@ -156,6 +169,10 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
 
     public void OnUnload()
     {
+        _updateService?.Dispose();
+        _updateService = null;
+        InputEvents.OnTouch -= OnTouch;
+        EndReplayInputPlayback();
         SaveSettings();
         CloseReplayManager();
         try
@@ -192,6 +209,11 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             _loadDeadlineUtc = default;
             _resultAttemptSaved = false;
             _resultSaveQueued = false;
+            _replayTouchIndex = 0;
+            _recordingStartTicks = 0;
+            _replayClockStartTicks = 0;
+            _replayPausedTicks = 0;
+            _replayPauseStartTicks = 0;
             _toast = "";
             _toastUntilUtc = default;
         }
@@ -202,6 +224,13 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
     {
         try
         {
+            _updateService?.DrawForegroundNotification();
+            Vector2 display = ImGui.GetIO().DisplaySize;
+            if (display.X > 1f && display.Y > 1f)
+            {
+                Volatile.Write(ref _inputDisplayWidth, Math.Max(0, (int)MathF.Round(display.X)));
+                Volatile.Write(ref _inputDisplayHeight, Math.Max(0, (int)MathF.Round(display.Y)));
+            }
             DrawHud(drawList);
             DrawReplayControls();
             DrawResultSaveButton();
@@ -215,6 +244,29 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
                 return;
             _renderErrorLogged = true;
             Logger.Error(LogTag, $"HUD render failed: {exception}");
+        }
+    }
+
+    private void OnTouch(TouchEventInfo info)
+    {
+        lock (_stateLock)
+        {
+            if (!_recording || _currentAttempt == null || _managerOpen)
+                return;
+
+            int pointerId = info.Action == AndroidInput.MotionAction.Cancel
+                ? -1
+                : info.PointerId >= 0 ? info.PointerId : info.PointerIndex;
+            _currentAttempt.TouchEvents.Add(new ReplayTouchInput
+            {
+                TimeMilliseconds = GetElapsedMilliseconds(_recordingStartTicks),
+                Action = (int)info.Action,
+                PointerId = pointerId,
+                X = info.X,
+                Y = info.Y,
+                SourceWidth = Volatile.Read(ref _inputDisplayWidth),
+                SourceHeight = Volatile.Read(ref _inputDisplayHeight),
+            });
         }
     }
 
@@ -281,6 +333,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             if (ImGui.Button(ui.Stop))
                 _commands.Enqueue(new ReplayCommand(ReplayCommandKind.Stop));
         }
+        _updateService?.DrawGui();
     }
 
     internal bool ShouldBlockPlayerHit(nint player)
@@ -463,23 +516,30 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
         if (activated)
         {
             _game?.CancelPendingCustomReplayLoad();
+            BeginReplayInputPlayback();
             Logger.Info(LogTag, "Replay activated after level load");
             return;
         }
         if (restarted)
+        {
+            BeginReplayInputPlayback();
             return;
+        }
 
-        QueueAttemptStart(controller, sequenceId);
+        if (QueueAttemptStart(controller, sequenceId))
+            SetRecordingAnchor(Stopwatch.GetTimestamp());
     }
 
     internal void HandleLevelLoadStarted(nint controller)
     {
+        EndReplayInputPlayback();
         ReplayData? discarded;
         lock (_stateLock)
         {
             discarded = _currentAttempt;
             _currentAttempt = null;
             _recording = false;
+            _recordingStartTicks = 0;
             _pendingAttemptController = controller;
             _pendingAttemptStartTile = -1;
             _pendingIdentity = null;
@@ -552,6 +612,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             _pendingIdentity = null;
             _identityStableTicks = 0;
         }
+        EndReplayInputPlayback();
         Logger.Info(LogTag, "Editor reset — cleared editor play state");
     }
     private void UpdateEditorHooks()
@@ -665,6 +726,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
 
     private void FailPendingReplayLoad(string error)
     {
+        EndReplayInputPlayback();
         _game?.CancelPendingCustomReplayLoad();
         lock (_stateLock)
         {
@@ -738,7 +800,11 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             if (game.GetControllerState(controller) != PlayerControlState) return;
         }
         if (game.IsPaused(controller))
+        {
+            PauseReplayClock();
             return;
+        }
+        ResumeReplayClock();
         _controller = controller;
         _player = player;
         // 编辑器 currentState 始终为 None，playMode 又会在倒计时前提前为 true。
@@ -749,8 +815,14 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
         if (state == ReplayRunState.WaitingForStart)
         {
             lock (_stateLock)
+            {
                 _runState = ReplayRunState.Playing;
+                if (_replayClockStartTicks == 0)
+                    _replayClockStartTicks = Stopwatch.GetTimestamp();
+                state = _runState;
+            }
         }
+        PublishDueReplayTouchEvents(replay);
 
         for (int count = 0; count < 10; count++)
         {
@@ -851,6 +923,140 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
         return result != 0 && game.GetCurrentSequence(controller) > currentSequence;
     }
 
+    private void BeginReplayInputPlayback()
+    {
+        lock (_stateLock)
+        {
+            _replayTouchIndex = 0;
+            // ReplayTouchInput.TimeMilliseconds uses the same Start_Rewind
+            // anchor as recording, so the touch and judgement timelines start
+            // from the same game event.
+            _replayClockStartTicks = Stopwatch.GetTimestamp();
+            _replayPausedTicks = 0;
+            _replayPauseStartTicks = 0;
+        }
+        ReplayKeyViewerApi.BeginPlayback();
+    }
+
+    private void EndReplayInputPlayback()
+    {
+        lock (_stateLock)
+        {
+            _replayTouchIndex = 0;
+            _replayClockStartTicks = 0;
+            _replayPausedTicks = 0;
+            _replayPauseStartTicks = 0;
+        }
+        ReplayKeyViewerApi.EndPlayback();
+    }
+
+    private void PublishDueReplayTouchEvents(ReplayData replay)
+    {
+        if (!ReplayKeyViewerApi.IsPlaybackActive)
+            return;
+
+        List<ReplayTouchInput>? due = null;
+        lock (_stateLock)
+        {
+            if (_replayClockStartTicks == 0)
+                return;
+
+            long elapsedMilliseconds = GetReplayElapsedMillisecondsLocked();
+            while (_replayTouchIndex < replay.TouchEvents.Count)
+            {
+                ReplayTouchInput input = replay.TouchEvents[_replayTouchIndex];
+                if (input.TimeMilliseconds > elapsedMilliseconds)
+                    break;
+                due ??= new List<ReplayTouchInput>();
+                due.Add(input);
+                _replayTouchIndex++;
+            }
+        }
+
+        if (due == null)
+            return;
+        foreach (ReplayTouchInput input in due)
+        {
+            ReplayKeyViewerApi.PublishTouch(
+                input.Action,
+                input.PointerId,
+                input.X,
+                input.Y,
+                input.SourceWidth,
+                input.SourceHeight);
+        }
+    }
+
+    private long GetReplayElapsedMillisecondsLocked()
+    {
+        long now = Stopwatch.GetTimestamp();
+        long pausedTicks = _replayPausedTicks;
+        if (_replayPauseStartTicks != 0)
+            pausedTicks += Math.Max(0L, now - _replayPauseStartTicks);
+        long activeTicks = Math.Max(0L, now - _replayClockStartTicks - pausedTicks);
+        double milliseconds = activeTicks * 1000d / Stopwatch.Frequency;
+        return milliseconds >= long.MaxValue ? long.MaxValue : (long)milliseconds;
+    }
+
+    private void PauseReplayClock()
+    {
+        lock (_stateLock)
+        {
+            if (_replayClockStartTicks != 0 && _replayPauseStartTicks == 0)
+                _replayPauseStartTicks = Stopwatch.GetTimestamp();
+        }
+    }
+
+    private void ResumeReplayClock()
+    {
+        long now = Stopwatch.GetTimestamp();
+        lock (_stateLock)
+        {
+            if (_replayPauseStartTicks == 0)
+                return;
+            _replayPausedTicks += Math.Max(0L, now - _replayPauseStartTicks);
+            _replayPauseStartTicks = 0;
+        }
+    }
+
+    private void SetRecordingAnchor(long anchorTicks)
+    {
+        lock (_stateLock)
+        {
+            if (_recordingStartTicks != 0 && _currentAttempt != null)
+            {
+                long offsetMilliseconds = GetElapsedMillisecondsBetween(
+                    _recordingStartTicks,
+                    anchorTicks);
+                foreach (ReplayTouchInput input in _currentAttempt.TouchEvents)
+                    input.TimeMilliseconds = Math.Max(
+                        0L,
+                        input.TimeMilliseconds - offsetMilliseconds);
+            }
+            _recordingStartTicks = anchorTicks;
+        }
+    }
+
+    private static long GetElapsedMilliseconds(long startTicks)
+    {
+        if (startTicks == 0)
+            return 0;
+        return GetElapsedMillisecondsBetween(startTicks, Stopwatch.GetTimestamp());
+    }
+
+    private static long GetElapsedMillisecondsBetween(long startTicks, long endTicks)
+    {
+        long elapsedTicks = endTicks - startTicks;
+        if (elapsedTicks == 0)
+            return 0;
+        double milliseconds = elapsedTicks * 1000d / Stopwatch.Frequency;
+        if (milliseconds >= long.MaxValue)
+            return long.MaxValue;
+        if (milliseconds <= long.MinValue)
+            return long.MinValue;
+        return (long)milliseconds;
+    }
+
     internal bool HandleFail(nint controller)
     {
         ReplayData? replay;
@@ -904,6 +1110,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
 
     internal void ReleaseReplayAfterResult(string result)
     {
+        EndReplayInputPlayback();
         bool released;
         lock (_stateLock)
         {
@@ -959,6 +1166,8 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             _player = player;
             _currentAttempt = attempt;
             _recording = true;
+            if (_recordingStartTicks == 0)
+                _recordingStartTicks = Stopwatch.GetTimestamp();
             _runState = ReplayRunState.Idle;
         }
         Logger.Info(
@@ -976,6 +1185,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             if (_currentAttempt == null)
             {
                 _recording = false;
+                _recordingStartTicks = 0;
                 return null;
             }
             if (_currentAttempt.Hits.Count == 0)
@@ -983,6 +1193,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
                 Logger.Warn(LogTag, $"Recording ended without captured hits: {_currentAttempt.SongName}");
                 _currentAttempt = null;
                 _recording = false;
+                _recordingStartTicks = 0;
                 return null;
             }
 
@@ -994,6 +1205,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             finalized = CloneReplay(_lastAttempt);
             _currentAttempt = null;
             _recording = false;
+            _recordingStartTicks = 0;
             // 编辑器模式下暂停自动录制，等下次 Start_Rewind 触发再恢复。
             if (_editorPlayRequested)
                 _editorFinalized = true;
@@ -1212,16 +1424,24 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
         if (game == null)
             return;
         nint controller = game.GetController();
+        long now = Stopwatch.GetTimestamp();
         lock (_stateLock)
         {
             if (_runState == ReplayRunState.Playing)
             {
                 game.SetPaused(controller, true);
+                if (_replayClockStartTicks != 0)
+                    _replayPauseStartTicks = now;
                 _runState = ReplayRunState.Paused;
             }
             else if (_runState == ReplayRunState.Paused)
             {
                 game.SetPaused(controller, false);
+                if (_replayPauseStartTicks != 0)
+                {
+                    _replayPausedTicks += Math.Max(0L, now - _replayPauseStartTicks);
+                    _replayPauseStartTicks = 0;
+                }
                 _runState = ReplayRunState.Playing;
             }
         }
@@ -1229,6 +1449,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
 
     private void StopPlaybackNow(bool resumeRecording = true)
     {
+        EndReplayInputPlayback();
         GameApi? game = _game;
         game?.CancelPendingCustomReplayLoad();
         nint controller = game?.GetController() ?? 0;
@@ -1324,6 +1545,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             return;
 
         game.SetPaused(controller, true);
+        PauseReplayClock();
         lock (_stateLock)
         {
             if (_managerOpen)
@@ -1333,6 +1555,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             }
         }
         game.SetPaused(controller, false);
+        ResumeReplayClock();
     }
 
     private void ResumeAfterReplayManagerNow()
@@ -1342,7 +1565,10 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
         if (controller != 0
             && game?.IsGameWorld(controller) == true
             && !game.IsEditorScene())
+        {
             game?.SetPaused(controller, false);
+            ResumeReplayClock();
+        }
     }
 
     private void DrawIslandEntry()
@@ -2265,7 +2491,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
         return currentSequence > 0 ? currentSequence : 0;
     }
 
-    private void QueueAttemptStart(nint controller, int startTile)
+    private bool QueueAttemptStart(nint controller, int startTile)
     {
         // 起始砖在这里就地解析：此时 Start_Rewind 的原函数已经跑完，GCS.checkpointNum 与
         // 本局真实起点一致（PC 版同样在 Start_Rewind 的 postfix 里读取该字段）。
@@ -2275,13 +2501,15 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
         lock (_stateLock)
         {
             if (_activeReplay != null || _pendingReplay != null)
-                return;
+                return false;
             _currentAttempt = null;
             _recording = false;
+            _recordingStartTicks = 0;
             _pendingAttemptController = controller;
             _pendingAttemptStartTile = resolved;
             _pendingIdentity = null;
             _identityStableTicks = 0;
+            return true;
         }
     }
 
@@ -2339,6 +2567,19 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
                 NoFailHit = hit.NoFailHit,
                 AutoHit = hit.AutoHit,
             }).ToList(),
+            TouchEvents = (source.TouchEvents ?? new List<ReplayTouchInput>())
+                .Where(input => input != null)
+                .Select(input => new ReplayTouchInput
+                {
+                    TimeMilliseconds = input.TimeMilliseconds,
+                    Action = input.Action,
+                    PointerId = input.PointerId,
+                    X = input.X,
+                    Y = input.Y,
+                    SourceWidth = input.SourceWidth,
+                    SourceHeight = input.SourceHeight,
+                })
+                .ToList(),
         };
     }
 

@@ -46,7 +46,7 @@ jobs:
       - name: Build StArray.ModManager references
         run: >-
           dotnet build
-          dependencies/StArray.ModManager/StArray.ModManager/StArray.ModManager.csproj
+          dependencies/StArray.ModManager/StArray.ModManager.Android/StArray.ModManager.Android.csproj
           --configuration Release
 
       - name: Prepare build references
@@ -55,17 +55,19 @@ jobs:
           set -euo pipefail
 
           manager_root="dependencies/StArray.ModManager"
-          manager_output="$manager_root/StArray.ModManager/bin/Release/net10.0"
+          manager_output="$manager_root/StArray.ModManager.Android/bin/Release/net10.0"
           analyzer_output="$manager_root/StArray.ModManager.Analyzer/bin/Release/netstandard2.0"
           imgui_dll="$(find "$HOME/.nuget/packages/imgui.net" -path '*/lib/net8.0/ImGui.NET.dll' -type f | sort -V | tail -n 1)"
           nrbf_dll="$(find "$DOTNET_ROOT/sdk" -mindepth 2 -maxdepth 2 -name 'System.Formats.Nrbf.dll' -type f | sort -V | tail -n 1)"
 
           test -f "$manager_output/StArray.ModManager.dll"
+          test -f "$manager_output/StArray.ModManager.Android.dll"
           test -f "$analyzer_output/StArray.ModManager.Analyzer.dll"
           test -f "$imgui_dll"
           test -f "$nrbf_dll"
 
           cp "$manager_output/StArray.ModManager.dll" References/StArray.ModManager.dll
+          cp "$manager_output/StArray.ModManager.Android.dll" References/StArray.ModManager.Android.dll
           cp "$analyzer_output/StArray.ModManager.Analyzer.dll" References/StArray.ModManager.Analyzer.dll
           cp "$imgui_dll" References/ImGui.NET.dll
           cp "$nrbf_dll" References/System.Formats.Nrbf.dll

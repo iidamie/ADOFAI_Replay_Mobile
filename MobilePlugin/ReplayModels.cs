@@ -4,7 +4,7 @@ namespace Replay.Mobile;
 
 public sealed class ReplayData
 {
-    public int FormatVersion { get; set; } = 1;
+    public int FormatVersion { get; set; } = 2;
     public string ModVersion { get; set; } = ReplayPlugin.ModVersion;
     public string SessionId { get; set; } = Guid.NewGuid().ToString("N");
     public DateTime RecordedAtUtc { get; set; } = DateTime.UtcNow;
@@ -22,6 +22,7 @@ public sealed class ReplayData
     public int EndTile { get; set; }
     public int TotalTiles { get; set; }
     public List<ReplayHit> Hits { get; set; } = new();
+    public List<ReplayTouchInput> TouchEvents { get; set; } = new();
 }
 
 public sealed class ReplayHit
@@ -31,6 +32,21 @@ public sealed class ReplayHit
     public int HitMargin { get; set; } = 3;
     public bool NoFailHit { get; set; }
     public bool AutoHit { get; set; }
+}
+
+/// <summary>
+/// 与判定轨道独立的移动端触摸输入轨道。这里保存录制过程中收到的每个完整
+/// InputEvents.OnTouch 快照；未产生游戏判定的触摸也会保留。
+/// </summary>
+public sealed class ReplayTouchInput
+{
+    public long TimeMilliseconds { get; set; }
+    public int Action { get; set; }
+    public int PointerId { get; set; } = -1;
+    public float X { get; set; }
+    public float Y { get; set; }
+    public float SourceWidth { get; set; }
+    public float SourceHeight { get; set; }
 }
 
 internal sealed class ReplaySettings
@@ -51,6 +67,7 @@ internal sealed class ReplaySettings
 
 [JsonSourceGenerationOptions(PropertyNameCaseInsensitive = true, WriteIndented = true)]
 [JsonSerializable(typeof(ReplayData))]
+[JsonSerializable(typeof(ReplayTouchInput))]
 [JsonSerializable(typeof(ReplaySettings))]
 internal partial class ReplayJsonContext : JsonSerializerContext
 {

@@ -1,9 +1,16 @@
 # Changelog
 
+## 1.5.1
+
+- 增加 Replay 内置 GitHub 更新功能，支持从最新 Release 下载并事务替换 Mod 文件。
+- 更新时保留 `replay_settings.json` 与 `Replays` 目录，完成后提示重启游戏。
+
 ## 1.5.0 (2026-08-03)
 
 - 修复自定义关卡无法触发自动保存的问题。
 - 版本号改用语义化版本，不再累加 `mobile.N` 后缀。
+- 回放保存格式改为 Deflate 压缩二进制 `.rpl2`，触摸轨道使用差分与变长编码以减少文件体积。
+- 继续兼容读取手机版 JSON `.rpl` 与 PC 版 BinaryFormatter `.rpl`，不要求迁移已有文件。
 
 ## 1.0.0 (2026-08-01)
 
@@ -42,13 +49,13 @@ ADOFAI Replay 手机版正式发布，基于 PC 版 [ADOFAI-Replay](https://gith
 - 基于 `StArray.ModManager 1.0.4+`，通过 `IModPlugin` 接口加载
 - 使用 Dobby IL2CPP Hook 替代 PC 版 Harmony，无需 Unity 程序集依赖
 - 编辑器 Hook 按场景动态安装 / 卸载，确保官方关卡回放不受影响
-- 使用源生成 JSON 序列化，设置与回放文件独立于 ModManager 自带序列化器
+- 设置使用源生成 JSON 序列化；回放使用独立的 `.rpl2` 二进制编解码器，不依赖 ModManager 的多态序列化器
 - UI 层使用 ImGui（ModManager 内置），HUD 通过前景层绘制
 
 ### 已知限制
 
 - Android 14+ 默认不允许直接写入外部存储，建议回放目录使用 Mod 内部存储路径
-- 旧版 PC `.rpl` 文件（BinaryFormatter 格式）仅支持反序列化，手机版保存格式为 JSON
+- 旧版 PC `.rpl` 文件（BinaryFormatter 格式）仅支持反序列化；旧手机版 JSON `.rpl` 可读取，新文件保存为 `.rpl2`
 - 编辑器回放依赖 `scnEditor.Play` / `scnEditor.ResetScene` Dobby Hook，可能与未来游戏版本不兼容
 
 ---
