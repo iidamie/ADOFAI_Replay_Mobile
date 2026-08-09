@@ -19,7 +19,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  MOD_MANAGER_REF: 2719a697dd43deb712f1bdd30a477fefa90a6a25
+  MOD_MANAGER_REF: main
 
 jobs:
   build-release:
