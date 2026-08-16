@@ -193,6 +193,7 @@ internal sealed class ReplayStore
             throw new InvalidDataException($"不支持回放格式版本 {replay.FormatVersion}。");
         replay.Hits ??= new List<ReplayHit>();
         replay.TouchEvents ??= new List<ReplayTouchInput>();
+        replay.KeyboardEvents ??= new List<ReplayKeyboardInput>();
         replay.SongName = string.IsNullOrWhiteSpace(replay.SongName) ? "Unknown" : replay.SongName.Trim();
         replay.Title = NormalizeTitle(replay.Title);
         replay.ArtistName ??= "";
@@ -227,6 +228,23 @@ internal sealed class ReplayStore
                 ? input.SourceHeight
                 : 0f;
         }
+
+        for (int index = replay.KeyboardEvents.Count - 1; index >= 0; index--)
+        {
+            ReplayKeyboardInput input = replay.KeyboardEvents[index];
+            if (input == null || string.IsNullOrWhiteSpace(input.Binding))
+            {
+                replay.KeyboardEvents.RemoveAt(index);
+                continue;
+            }
+            input.TimeMilliseconds = Math.Clamp(input.TimeMilliseconds, 0L, 86_400_000L);
+            input.Binding = input.Binding.Trim();
+            input.Action = input.Action == 1 ? 1 : 0;
+            input.Repeat = Math.Max(0, input.Repeat);
+        }
+        replay.KeyboardEvents = replay.KeyboardEvents
+            .OrderBy(input => input.TimeMilliseconds)
+            .ToList();
     }
 
     private static string SanitizeFileName(string value)
@@ -309,7 +327,7 @@ internal static class Rpl2ReplayCodec
     private static readonly byte[] Magic = { (byte)'R', (byte)'P', (byte)'L', (byte)'2' };
     private static readonly UTF8Encoding Utf8 = new(false, true);
 
-    private const byte ContainerVersion = 1;
+    private const byte ContainerVersion = 2;
     private const byte DeflateCompression = 1;
     private const int PayloadLengthOffset = 8;
     private const long MaximumFileSize = 64L * 1024L * 1024L;
@@ -420,7 +438,8 @@ internal static class Rpl2ReplayCodec
                 throw new InvalidDataException("不是有效的 RPL2 回放文件。");
         }
 
-        if (header.ReadByte() != ContainerVersion)
+        byte containerVersion = header.ReadByte();
+        if (containerVersion is not (1 or ContainerVersion))
             throw new InvalidDataException("不支持的 RPL2 容器版本。");
         if (header.ReadByte() != DeflateCompression)
             throw new InvalidDataException("不支持的 RPL2 压缩方式。");
@@ -434,7 +453,7 @@ internal static class Rpl2ReplayCodec
         using DeflateStream deflate = new(stream, CompressionMode.Decompress, leaveOpen: true);
         using CountingReadStream payloadStream = new(deflate, payloadLength);
         using BinaryReader payload = new(payloadStream, Utf8, leaveOpen: true);
-        ReplayData replay = ReadPayload(payload);
+        ReplayData replay = ReadPayload(payload, containerVersion);
         Drain(payloadStream);
 
         if (payloadStream.BytesRead != payloadLength)
@@ -446,6 +465,7 @@ internal static class Rpl2ReplayCodec
     {
         EnsureCollectionCount(replay.Hits.Count);
         EnsureCollectionCount(replay.TouchEvents.Count);
+        EnsureCollectionCount(replay.KeyboardEvents.Count);
 
         WriteVarUInt(writer, checked((uint)replay.FormatVersion));
         WriteString(writer, replay.ModVersion ?? "");
@@ -520,9 +540,20 @@ internal static class Rpl2ReplayCodec
             previousWidth = width;
             previousHeight = height;
         }
+
+        WriteVarUInt(writer, checked((uint)replay.KeyboardEvents.Count));
+        previousTime = 0;
+        foreach (ReplayKeyboardInput input in replay.KeyboardEvents)
+        {
+            WriteVarLong(writer, input.TimeMilliseconds - previousTime);
+            WriteString(writer, input.Binding ?? "");
+            WriteVarInt(writer, input.Action);
+            WriteVarInt(writer, input.Repeat);
+            previousTime = input.TimeMilliseconds;
+        }
     }
 
-    private static ReplayData ReadPayload(BinaryReader reader)
+    private static ReplayData ReadPayload(BinaryReader reader, byte containerVersion)
     {
         uint formatVersion = ReadVarUInt(reader);
         if (formatVersion > int.MaxValue)
@@ -623,6 +654,27 @@ internal static class Rpl2ReplayCodec
                 SourceWidth = BitConverter.Int32BitsToSingle(unchecked((int)previousWidth)),
                 SourceHeight = BitConverter.Int32BitsToSingle(unchecked((int)previousHeight)),
             });
+        }
+
+        if (containerVersion >= 2)
+        {
+            int keyboardCount = ReadCollectionCount(reader, "键盘");
+            replay.KeyboardEvents = new List<ReplayKeyboardInput>(keyboardCount);
+            long keyboardTime = 0;
+            for (int index = 0; index < keyboardCount; index++)
+            {
+                keyboardTime = checked(keyboardTime + ReadVarLong(reader));
+                string binding = ReadString(reader);
+                int action = ReadInt32(reader, "键盘动作");
+                int repeat = ReadInt32(reader, "键盘重复次数");
+                replay.KeyboardEvents.Add(new ReplayKeyboardInput
+                {
+                    TimeMilliseconds = keyboardTime,
+                    Binding = binding,
+                    Action = action,
+                    Repeat = repeat,
+                });
+            }
         }
         return replay;
     }

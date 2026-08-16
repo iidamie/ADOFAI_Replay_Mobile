@@ -23,6 +23,7 @@ public sealed class ReplayData
     public int TotalTiles { get; set; }
     public List<ReplayHit> Hits { get; set; } = new();
     public List<ReplayTouchInput> TouchEvents { get; set; } = new();
+    public List<ReplayKeyboardInput> KeyboardEvents { get; set; } = new();
 }
 
 public sealed class ReplayHit
@@ -49,6 +50,19 @@ public sealed class ReplayTouchInput
     public float SourceHeight { get; set; }
 }
 
+/// <summary>
+/// 与判定轨道独立的硬件键盘输入轨道。Binding 使用 ImGui/Unity 兼容的规范化名称，
+/// 避免把 Android keyCode 泄漏到跨设备的回放文件中。
+/// </summary>
+public sealed class ReplayKeyboardInput
+{
+    public long TimeMilliseconds { get; set; }
+    public string Binding { get; set; } = "";
+    /// <summary>0 = key down, 1 = key up。</summary>
+    public int Action { get; set; }
+    public int Repeat { get; set; }
+}
+
 internal sealed class ReplaySettings
 {
     public int SettingsVersion { get; set; }
@@ -58,6 +72,10 @@ internal sealed class ReplaySettings
     public bool SaveFailureAt90Percent { get; set; } = true;
     public bool IgnoreAutoplay { get; set; } = true;
     public bool ShowReplayHud { get; set; } = true;
+    public bool ReceiveTouchInput { get; set; } = true;
+    // Hardware keyboard capture is opt-in so touch-only users never activate
+    // its hook or polling fallback.
+    public bool ReceiveKeyboardInput { get; set; }
     public int HudFontSize { get; set; } = 24;
     public float HudPositionX { get; set; } = 0.02f;
     public float HudPositionY { get; set; } = 0.08f;
@@ -68,6 +86,7 @@ internal sealed class ReplaySettings
 [JsonSourceGenerationOptions(PropertyNameCaseInsensitive = true, WriteIndented = true)]
 [JsonSerializable(typeof(ReplayData))]
 [JsonSerializable(typeof(ReplayTouchInput))]
+[JsonSerializable(typeof(ReplayKeyboardInput))]
 [JsonSerializable(typeof(ReplaySettings))]
 internal partial class ReplayJsonContext : JsonSerializerContext
 {

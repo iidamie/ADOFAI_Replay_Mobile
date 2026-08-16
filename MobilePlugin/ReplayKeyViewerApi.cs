@@ -27,6 +27,12 @@ public static class ReplayKeyViewerApi
     /// </summary>
     public static event Action<int, int, float, float, float, float>? ReplayTouch;
 
+    /// <summary>
+    /// 独立于 Android 实体输入通道的虚拟键盘事件。
+    /// 参数依次为：规范化绑定名、动作（0 down / 1 up）、重复次数。
+    /// </summary>
+    public static event Action<string, int, int>? ReplayKeyboard;
+
     internal static void BeginPlayback()
     {
         Interlocked.Exchange(ref _playbackActive, 1);
@@ -64,6 +70,27 @@ public static class ReplayKeyViewerApi
             catch (Exception exception)
             {
                 LogOnce($"Replay touch subscriber threw: {exception.Message}");
+            }
+        }
+    }
+
+    internal static void PublishKeyboard(string binding, int action, int repeat)
+    {
+        if (!IsPlaybackActive || string.IsNullOrWhiteSpace(binding))
+            return;
+        Action<string, int, int>? handlers = ReplayKeyboard;
+        if (handlers == null)
+            return;
+
+        foreach (Delegate handler in handlers.GetInvocationList())
+        {
+            try
+            {
+                ((Action<string, int, int>)handler)(binding, action, repeat);
+            }
+            catch (Exception exception)
+            {
+                LogOnce($"Replay keyboard subscriber threw: {exception.Message}");
             }
         }
     }

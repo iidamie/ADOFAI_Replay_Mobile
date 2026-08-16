@@ -37,6 +37,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
     private nint _pendingAttemptController;
     private int _replayIndex;
     private int _replayTouchIndex;
+    private int _replayKeyboardIndex;
     private long _recordingStartTicks;
     private long _replayClockStartTicks;
     private long _replayPausedTicks;
@@ -57,6 +58,9 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
     private bool _editorFinalized;
     private bool _editorHooksInstalled;
     private bool _renderErrorLogged;
+    private bool _loaded;
+    private bool _touchInputSubscribed;
+    private bool _keyboardInputActive;
     private bool _managerOpen;
     private bool _managerShowingDetails;
     private bool _managerPausedGame;
@@ -77,6 +81,8 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
     private bool _saveFailureAt90Percent = true;
     private bool _ignoreAutoplay = true;
     private bool _showReplayHud = true;
+    private bool _receiveTouchInput = true;
+    private bool _receiveKeyboardInput;
     private int _hudFontSize = 24;
     private float _hudPositionX = 0.02f;
     private float _hudPositionY = 0.08f;
@@ -155,7 +161,8 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             _game = null;
             throw new InvalidOperationException("Required Replay IL2CPP hooks could not be installed");
         }
-        InputEvents.OnTouch += OnTouch;
+        _loaded = true;
+        SyncInputReceivers();
         CustomLoadDiagnostics.Install(this);
         _updateService = new GitHubUpdateService(modDirectory, Version);
         _updateService.StartAutomaticCheck();
@@ -169,9 +176,12 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
 
     public void OnUnload()
     {
+        _loaded = false;
+        SyncInputReceivers();
         _updateService?.Dispose();
         _updateService = null;
-        InputEvents.OnTouch -= OnTouch;
+        ReplayKeyboardHook.Uninstall();
+        ReplayKeyboardRecorder.Reset();
         EndReplayInputPlayback();
         SaveSettings();
         CloseReplayManager();
@@ -210,6 +220,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             _resultAttemptSaved = false;
             _resultSaveQueued = false;
             _replayTouchIndex = 0;
+            _replayKeyboardIndex = 0;
             _recordingStartTicks = 0;
             _replayClockStartTicks = 0;
             _replayPausedTicks = 0;
@@ -224,6 +235,9 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
     {
         try
         {
+            SyncInputReceivers();
+            if (_keyboardInputActive)
+                ReplayKeyboardRecorder.Update(this);
             _updateService?.DrawForegroundNotification();
             Vector2 display = ImGui.GetIO().DisplaySize;
             if (display.X > 1f && display.Y > 1f)
@@ -249,6 +263,8 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
 
     private void OnTouch(TouchEventInfo info)
     {
+        if (!_receiveTouchInput)
+            return;
         lock (_stateLock)
         {
             if (!_recording || _currentAttempt == null || _managerOpen)
@@ -266,6 +282,40 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
                 Y = info.Y,
                 SourceWidth = Volatile.Read(ref _inputDisplayWidth),
                 SourceHeight = Volatile.Read(ref _inputDisplayHeight),
+            });
+        }
+    }
+
+    internal bool IsRecordingKeyboard
+    {
+        get
+        {
+            lock (_stateLock)
+                return _receiveKeyboardInput
+                    && _recording && _currentAttempt != null && !_managerOpen;
+        }
+    }
+
+    internal void CaptureNativeKeyboardEvent(IntPtr inputEvent)
+    {
+        ReplayKeyboardRecorder.CaptureNativeEvent(this, inputEvent);
+    }
+
+    internal void RecordKeyboardInput(string binding, int action, int repeat = 0)
+    {
+        if (!_receiveKeyboardInput || string.IsNullOrWhiteSpace(binding))
+            return;
+        lock (_stateLock)
+        {
+            if (!_recording || _currentAttempt == null || _managerOpen)
+                return;
+            _currentAttempt.KeyboardEvents ??= new List<ReplayKeyboardInput>();
+            _currentAttempt.KeyboardEvents.Add(new ReplayKeyboardInput
+            {
+                TimeMilliseconds = GetElapsedMilliseconds(_recordingStartTicks),
+                Binding = binding,
+                Action = action,
+                Repeat = Math.Max(0, repeat),
             });
         }
     }
@@ -297,6 +347,8 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
         settingsChanged |= ImGui.Checkbox(ui.SaveFailureAt90Percent, ref _saveFailureAt90Percent);
         settingsChanged |= ImGui.Checkbox(ui.DisableAutoReplay, ref _ignoreAutoplay);
         settingsChanged |= ImGui.Checkbox(ui.ShowHud, ref _showReplayHud);
+        settingsChanged |= ImGui.Checkbox(ui.ReceiveTouchInput, ref _receiveTouchInput);
+        settingsChanged |= ImGui.Checkbox(ui.ReceiveKeyboardInput, ref _receiveKeyboardInput);
         if (_showReplayHud)
         {
             settingsChanged |= ImGui.SliderInt(ui.HudSize, ref _hudFontSize, 12, 64);
@@ -308,6 +360,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
         if (settingsChanged)
         {
             NormalizeSettings();
+            SyncInputReceivers();
             SaveSettings();
         }
 
@@ -822,7 +875,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
                 state = _runState;
             }
         }
-        PublishDueReplayTouchEvents(replay);
+        PublishDueReplayInputEvents(replay);
 
         for (int count = 0; count < 10; count++)
         {
@@ -928,6 +981,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
         lock (_stateLock)
         {
             _replayTouchIndex = 0;
+            _replayKeyboardIndex = 0;
             // ReplayTouchInput.TimeMilliseconds uses the same Start_Rewind
             // anchor as recording, so the touch and judgement timelines start
             // from the same game event.
@@ -943,6 +997,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
         lock (_stateLock)
         {
             _replayTouchIndex = 0;
+            _replayKeyboardIndex = 0;
             _replayClockStartTicks = 0;
             _replayPausedTicks = 0;
             _replayPauseStartTicks = 0;
@@ -950,40 +1005,77 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
         ReplayKeyViewerApi.EndPlayback();
     }
 
-    private void PublishDueReplayTouchEvents(ReplayData replay)
+    private readonly record struct ReplayInputDispatch(
+        ReplayTouchInput? Touch,
+        ReplayKeyboardInput? Keyboard);
+
+    private void PublishDueReplayInputEvents(ReplayData replay)
     {
         if (!ReplayKeyViewerApi.IsPlaybackActive)
             return;
 
-        List<ReplayTouchInput>? due = null;
+        List<ReplayInputDispatch>? due = null;
         lock (_stateLock)
         {
             if (_replayClockStartTicks == 0)
                 return;
 
             long elapsedMilliseconds = GetReplayElapsedMillisecondsLocked();
-            while (_replayTouchIndex < replay.TouchEvents.Count)
+            replay.TouchEvents ??= new List<ReplayTouchInput>();
+            replay.KeyboardEvents ??= new List<ReplayKeyboardInput>();
+            while (true)
             {
-                ReplayTouchInput input = replay.TouchEvents[_replayTouchIndex];
-                if (input.TimeMilliseconds > elapsedMilliseconds)
+                ReplayTouchInput? touch = _replayTouchIndex < replay.TouchEvents.Count
+                    ? replay.TouchEvents[_replayTouchIndex]
+                    : null;
+                ReplayKeyboardInput? keyboard = _replayKeyboardIndex < replay.KeyboardEvents.Count
+                    ? replay.KeyboardEvents[_replayKeyboardIndex]
+                    : null;
+                if (touch == null && keyboard == null)
                     break;
-                due ??= new List<ReplayTouchInput>();
-                due.Add(input);
-                _replayTouchIndex++;
+
+                bool takeTouch = touch != null
+                    && (keyboard == null || touch.TimeMilliseconds <= keyboard.TimeMilliseconds);
+                long eventTime = takeTouch
+                    ? touch!.TimeMilliseconds
+                    : keyboard!.TimeMilliseconds;
+                if (eventTime > elapsedMilliseconds)
+                    break;
+                due ??= new List<ReplayInputDispatch>();
+                if (takeTouch)
+                {
+                    due.Add(new ReplayInputDispatch(touch, null));
+                    _replayTouchIndex++;
+                }
+                else
+                {
+                    due.Add(new ReplayInputDispatch(null, keyboard));
+                    _replayKeyboardIndex++;
+                }
             }
         }
 
         if (due == null)
             return;
-        foreach (ReplayTouchInput input in due)
+        foreach (ReplayInputDispatch dispatch in due)
         {
-            ReplayKeyViewerApi.PublishTouch(
-                input.Action,
-                input.PointerId,
-                input.X,
-                input.Y,
-                input.SourceWidth,
-                input.SourceHeight);
+            if (dispatch.Touch is { } input)
+            {
+                ReplayKeyViewerApi.PublishTouch(
+                    input.Action,
+                    input.PointerId,
+                    input.X,
+                    input.Y,
+                    input.SourceWidth,
+                    input.SourceHeight);
+            }
+            else if (dispatch.Keyboard is { } keyboard)
+            {
+                ReplayKeyViewerApi.PublishKeyboard(
+                    keyboard.Binding,
+                    keyboard.Action,
+                    keyboard.Repeat);
+            }
         }
     }
 
@@ -1025,10 +1117,16 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
         {
             if (_recordingStartTicks != 0 && _currentAttempt != null)
             {
+                _currentAttempt.TouchEvents ??= new List<ReplayTouchInput>();
+                _currentAttempt.KeyboardEvents ??= new List<ReplayKeyboardInput>();
                 long offsetMilliseconds = GetElapsedMillisecondsBetween(
                     _recordingStartTicks,
                     anchorTicks);
                 foreach (ReplayTouchInput input in _currentAttempt.TouchEvents)
+                    input.TimeMilliseconds = Math.Max(
+                        0L,
+                        input.TimeMilliseconds - offsetMilliseconds);
+                foreach (ReplayKeyboardInput input in _currentAttempt.KeyboardEvents)
                     input.TimeMilliseconds = Math.Max(
                         0L,
                         input.TimeMilliseconds - offsetMilliseconds);
@@ -1143,6 +1241,8 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
         if (player == 0 || _ignoreAutoplay && game.IsPlayerAuto(player))
             return;
 
+        ReplayKeyboardRecorder.Reset();
+
         ReplayData attempt = new()
         {
             RecordedAtUtc = DateTime.UtcNow,
@@ -1210,9 +1310,14 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             if (_editorPlayRequested)
                 _editorFinalized = true;
         }
+        ReplayKeyboardRecorder.Reset();
         if (finalized == null)
             return null;
-        Logger.Info(LogTag, $"Recording finalized: {finalized.Hits.Count} hits, completed={completed}");
+        Logger.Info(
+            LogTag,
+            $"Recording finalized: {finalized.Hits.Count} hits, "
+            + $"touches={finalized.TouchEvents.Count}, keyboard={finalized.KeyboardEvents.Count}, "
+            + $"completed={completed}");
         return finalized;
     }
 
@@ -2350,18 +2455,51 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
         _replayDirectory ??= "";
     }
 
+    private void SyncInputReceivers()
+    {
+        bool receiveTouch = _loaded && _receiveTouchInput;
+        if (receiveTouch != _touchInputSubscribed)
+        {
+            if (receiveTouch)
+                InputEvents.OnTouch += OnTouch;
+            else
+                InputEvents.OnTouch -= OnTouch;
+            _touchInputSubscribed = receiveTouch;
+        }
+
+        bool receiveKeyboard = _loaded && _receiveKeyboardInput;
+        if (receiveKeyboard == _keyboardInputActive)
+            return;
+
+        _keyboardInputActive = receiveKeyboard;
+        if (receiveKeyboard)
+        {
+            // One opt-in attempt is enough. On devices without this native
+            // symbol, the recorder uses its Unity/ImGui fallback while recording.
+            ReplayKeyboardHook.Install(this);
+        }
+        else
+        {
+            ReplayKeyboardHook.Uninstall();
+            ReplayKeyboardRecorder.Reset();
+        }
+    }
+
     private void LoadSettings()
     {
         try
         {
             ReplaySettings settings = RequireStore().LoadSettings();
             bool currentSettings = settings.SettingsVersion >= 2;
+            bool inputSettings = settings.SettingsVersion >= 3;
             _saveFullClear = currentSettings ? settings.SaveFullClear : true;
             _saveEveryCompletion = currentSettings && settings.SaveEveryCompletion;
             _saveEveryFailure = currentSettings && settings.SaveEveryFailure;
             _saveFailureAt90Percent = !currentSettings || settings.SaveFailureAt90Percent;
             _ignoreAutoplay = settings.IgnoreAutoplay;
             _showReplayHud = settings.ShowReplayHud;
+            _receiveTouchInput = inputSettings ? settings.ReceiveTouchInput : true;
+            _receiveKeyboardInput = inputSettings && settings.ReceiveKeyboardInput;
             _hudFontSize = settings.HudFontSize;
             _hudPositionX = settings.HudPositionX;
             _hudPositionY = settings.HudPositionY;
@@ -2386,13 +2524,15 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             NormalizeSettings();
             store.SaveSettings(new ReplaySettings
             {
-                SettingsVersion = 2,
+                SettingsVersion = 3,
                 SaveFullClear = _saveFullClear,
                 SaveEveryCompletion = _saveEveryCompletion,
                 SaveEveryFailure = _saveEveryFailure,
                 SaveFailureAt90Percent = _saveFailureAt90Percent,
                 IgnoreAutoplay = _ignoreAutoplay,
                 ShowReplayHud = _showReplayHud,
+                ReceiveTouchInput = _receiveTouchInput,
+                ReceiveKeyboardInput = _receiveKeyboardInput,
                 HudFontSize = _hudFontSize,
                 HudPositionX = _hudPositionX,
                 HudPositionY = _hudPositionY,
@@ -2578,6 +2718,17 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
                     Y = input.Y,
                     SourceWidth = input.SourceWidth,
                     SourceHeight = input.SourceHeight,
+                })
+                .ToList(),
+            KeyboardEvents = (source.KeyboardEvents ?? new List<ReplayKeyboardInput>())
+                .Where(input => input != null)
+                .OrderBy(input => input.TimeMilliseconds)
+                .Select(input => new ReplayKeyboardInput
+                {
+                    TimeMilliseconds = input.TimeMilliseconds,
+                    Binding = input.Binding ?? "",
+                    Action = input.Action,
+                    Repeat = input.Repeat,
                 })
                 .ToList(),
         };
