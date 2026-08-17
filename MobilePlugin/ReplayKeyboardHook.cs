@@ -4,7 +4,7 @@ using StArray.ModManager.Manager;
 
 namespace Replay.Mobile;
 
-internal static partial class ReplayKeyboardHook
+public static partial class ReplayKeyboardHook
 {
     private static ReplayPlugin? _plugin;
     private static bool _installed;
