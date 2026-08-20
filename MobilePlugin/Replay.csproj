@@ -11,26 +11,24 @@
     <Optimize>true</Optimize>
     <DebugType>embedded</DebugType>
     <Deterministic>true</Deterministic>
-    <StarryReferences Condition="'$(StarryReferences)' == ''">../References</StarryReferences>
-    <StarryAnalyzer Condition="'$(StarryAnalyzer)' == ''">$(StarryReferences)/StArray.ModManager.Analyzer.dll</StarryAnalyzer>
   </PropertyGroup>
 
   <ItemGroup>
-    <Analyzer Include="$(StarryAnalyzer)" />
+    <Analyzer Include="..\References\StArray.ModManager.Analyzer.dll" />
     <Reference Include="StArray.ModManager">
-      <HintPath>$(StarryReferences)/StArray.ModManager.dll</HintPath>
+      <HintPath>..\References\StArray.ModManager.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="StArray.ModManager.Android">
-      <HintPath>$(StarryReferences)/StArray.ModManager.Android.dll</HintPath>
+      <HintPath>..\References\StArray.ModManager.Android.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="ImGui.NET">
-      <HintPath>$(StarryReferences)/ImGui.NET.dll</HintPath>
+      <HintPath>..\References\ImGui.NET.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="System.Formats.Nrbf">
-      <HintPath>$(StarryReferences)/System.Formats.Nrbf.dll</HintPath>
+      <HintPath>..\References\System.Formats.Nrbf.dll</HintPath>
       <Private>true</Private>
     </Reference>
   </ItemGroup>

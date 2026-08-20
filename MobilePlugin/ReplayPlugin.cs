@@ -5,7 +5,6 @@ using System.Reflection;
 using System.Text;
 using ImGuiNET;
 using StArray.ModManager.Android.Native;
-using StArray.ModManager.Interop;
 using StArray.ModManager.Manager;
 using StArray.ModManager.Runtime;
 
@@ -163,7 +162,6 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             throw new InvalidOperationException("Required Replay IL2CPP hooks could not be installed");
         }
         _loaded = true;
-        ReplayKeyViewerApi.InitializeV2();
         SyncInputReceivers();
         CustomLoadDiagnostics.Install(this);
         _updateService = new GitHubUpdateService(modDirectory, Version);
@@ -185,7 +183,6 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
         ReplayKeyboardHook.Uninstall();
         ReplayKeyboardRecorder.Reset();
         EndReplayInputPlayback();
-        ReplayKeyViewerApi.ShutdownV2();
         SaveSettings();
         CloseReplayManager();
         try
@@ -1060,7 +1057,6 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
 
         if (due == null)
             return;
-        var v2Events = new List<VirtualInputEvent>(due.Count);
         foreach (ReplayInputDispatch dispatch in due)
         {
             if (dispatch.Touch is { } input)
@@ -1072,16 +1068,6 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
                     input.Y,
                     input.SourceWidth,
                     input.SourceHeight);
-                if (ReplayKeyViewerApi.TryCreateTouchV2(
-                        input.TimeMilliseconds,
-                        input.Action,
-                        input.PointerId,
-                        input.X,
-                        input.Y,
-                        input.SourceWidth,
-                        input.SourceHeight,
-                        out var v2))
-                    v2Events.Add(v2);
             }
             else if (dispatch.Keyboard is { } keyboard)
             {
@@ -1089,16 +1075,8 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
                     keyboard.Binding,
                     keyboard.Action,
                     keyboard.Repeat);
-                if (ReplayKeyViewerApi.TryCreateKeyboardV2(
-                        keyboard.TimeMilliseconds,
-                        keyboard.Binding,
-                        keyboard.Action,
-                        keyboard.Repeat,
-                        out var v2))
-                    v2Events.Add(v2);
             }
         }
-        ReplayKeyViewerApi.PublishV2(v2Events);
     }
 
     private long GetReplayElapsedMillisecondsLocked()
