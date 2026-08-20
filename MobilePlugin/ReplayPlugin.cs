@@ -939,7 +939,12 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             bool previousNoFail = game.SetNoFailInfinite(controller, hit.NoFailHit || midSpin);
             try
             {
-                GameHooks.InjectPlayerHit(player, autoHit: true, midSpin ? 3 : hit.HitMargin);
+                // Final display judgements are not raw timing margins. Keep
+                // their recording while injecting a valid movement margin.
+                int injectedMargin = midSpin || hit.AutoHit || hit.HitMargin is 7 or 10 or 11
+                    ? 3
+                    : hit.HitMargin;
+                GameHooks.InjectPlayerHit(player, autoHit: true, injectedMargin);
             }
             finally
             {

@@ -8,15 +8,29 @@ public static partial class GameHooks
 {
     private const string LogTag = "Replay";
     private const int HookCount = 10;
+    private const int FailOverloadHitMargin = 9;
 
     private static ReplayPlugin? _plugin;
     private static nint _playerHitMethodInfo;
     private static nint _getHitMarginMethodInfo;
-    private static bool _capturingHit;
-    private static int _capturedMargin = 3;
-    private static bool _capturedMarginAvailable;
+    [ThreadStatic]
+    private static HitCapture? _hitCapture;
+    [ThreadStatic]
     private static bool _injectingHit;
     private static int _injectedMargin = 3;
+
+    private sealed class HitCapture
+    {
+        internal HitCapture(PendingHit pending)
+        {
+            Pending = pending;
+        }
+
+        internal PendingHit Pending { get; }
+        internal int Margin { get; set; } = 3;
+        internal bool MarginAvailable { get; set; }
+        internal int MarginPriority { get; set; }
+    }
 
     internal static bool Install(ReplayPlugin plugin, GameApi game)
     {
@@ -40,6 +54,11 @@ public static partial class GameHooks
                 return false;
             }
 
+            if (!ReplayJudgementHooks.Install())
+                Logger.Warn(LogTag, "Multipress judgement hook unavailable; replay will use raw hit margins");
+            if (!ReplayHitTextHooks.Install())
+                Logger.Warn(LogTag, "Final hit-text judgement hook unavailable; replay will use raw hit margins");
+
             Logger.Info(LogTag, $"Installed {HookCount} generated IL2CPP hooks");
             return true;
         }
@@ -53,12 +72,13 @@ public static partial class GameHooks
 
     internal static void Uninstall()
     {
+        ReplayJudgementHooks.Uninstall();
+        ReplayHitTextHooks.Uninstall();
         UninstallHooks();
         _plugin = null;
         _playerHitMethodInfo = 0;
         _getHitMarginMethodInfo = 0;
-        _capturingHit = false;
-        _capturedMarginAvailable = false;
+        _hitCapture = null;
         _injectingHit = false;
     }
 
@@ -98,6 +118,41 @@ public static partial class GameHooks
             _getHitMarginMethodInfo);
     }
 
+    /// <summary>
+    /// Captures the final judgement associated with the current input. The
+    /// raw GetHitMargin result only describes timing; multipress, fail-overload
+    /// and overpress can be decided later in the same game call.
+    /// </summary>
+    internal static void CaptureJudgement(int hitMargin)
+    {
+        if ((uint)hitMargin > 11u)
+            return;
+
+        HitCapture? capture = _hitCapture;
+        if (capture == null)
+            return;
+
+        int priority = hitMargin == FailOverloadHitMargin
+            ? 2
+            : hitMargin is 7 or 8 or 10 or 11
+                ? 1
+                : 0;
+        // A multipress may call OnDamage/Die first and then display the less
+        // specific Multipress text. Preserve the stronger FailOverload result.
+        if (priority < capture.MarginPriority)
+            return;
+
+        capture.Margin = hitMargin;
+        capture.MarginAvailable = true;
+        capture.MarginPriority = priority;
+        _plugin?.CompleteHit(capture.Pending, hitMargin);
+    }
+
+    internal static void CaptureMultipressJudgement()
+    {
+        CaptureJudgement(FailOverloadHitMargin);
+    }
+
     [UnmanagedHook("Assembly-CSharp.dll", "scrPlayer", "Hit", ParameterCount = 1)]
     private static byte PlayerHit(nint instance, byte autoHit, nint methodInfo)
     {
@@ -114,9 +169,11 @@ public static partial class GameHooks
             Logger.Error(LogTag, $"Hit capture failed: {exception}");
         }
 
-        _capturingHit = pending.HasValue;
-        _capturedMargin = 3;
-        _capturedMarginAvailable = false;
+        HitCapture? previousCapture = _hitCapture;
+        HitCapture? capture = pending.HasValue
+            ? new HitCapture(pending.Value)
+            : null;
+        _hitCapture = capture;
         try
         {
             byte result = PlayerHitOriginal(instance, autoHit, methodInfo);
@@ -125,7 +182,7 @@ public static partial class GameHooks
                 if (pending.HasValue)
                     plugin?.CompleteHit(
                         pending.Value,
-                        _capturedMarginAvailable ? _capturedMargin : null);
+                        capture?.MarginAvailable == true ? capture.Margin : null);
             }
             catch (Exception exception)
             {
@@ -140,9 +197,7 @@ public static partial class GameHooks
         }
         finally
         {
-            _capturingHit = false;
-            _capturedMargin = 3;
-            _capturedMarginAvailable = false;
+            _hitCapture = previousCapture;
         }
     }
 
@@ -182,10 +237,11 @@ public static partial class GameHooks
 
         if (_injectingHit)
             return _injectedMargin;
-        if (_capturingHit)
+        HitCapture? capture = _hitCapture;
+        if (capture != null)
         {
-            _capturedMargin = result;
-            _capturedMarginAvailable = true;
+            capture.Margin = result;
+            capture.MarginAvailable = true;
         }
         return result;
     }
@@ -261,14 +317,18 @@ public static partial class GameHooks
     private static void FailAction(
         nint instance,
         byte overload,
-        byte showText,
-        nint customText,
-        byte useTransition,
+        byte multipress,
+        nint failMessage,
+        byte hitbox,
         nint methodInfo)
     {
         bool replayResult = false;
         try
         {
+            // HandleFail can finalize the current attempt. Commit the special
+            // judgement before that cleanup happens.
+            if (overload != 0 || multipress != 0)
+                CaptureMultipressJudgement();
             replayResult = _plugin?.HandleFail(instance) == true;
         }
         catch (Exception exception)
@@ -277,7 +337,7 @@ public static partial class GameHooks
         }
         try
         {
-            FailActionOriginal(instance, overload, showText, customText, useTransition, methodInfo);
+            FailActionOriginal(instance, overload, multipress, failMessage, hitbox, methodInfo);
         }
         finally
         {
