@@ -70,6 +70,7 @@ internal sealed class ReplaySettings
     public bool SaveEveryCompletion { get; set; }
     public bool SaveEveryFailure { get; set; }
     public bool SaveFailureAt90Percent { get; set; } = true;
+    public bool DisableTutorialAutoSave { get; set; } = true;
     public bool IgnoreAutoplay { get; set; } = true;
     public bool ShowReplayHud { get; set; } = true;
     public bool ReceiveTouchInput { get; set; } = true;
@@ -145,14 +146,23 @@ internal enum ReplayCommandKind
     TogglePause,
     PauseForManager,
     ResumeAfterManager,
+    StartPreview,
+    StopPreview,
+    SetOfficialPreview,
 }
 
-internal sealed record ReplayCommand(ReplayCommandKind Kind, ReplayData? Replay = null);
+internal sealed record ReplayCommand(
+    ReplayCommandKind Kind,
+    ReplayData? Replay = null,
+    ReplayChartAudioPreview? AudioPreview = null,
+    string OfficialLevelId = "");
 
 internal sealed record ReplayFileEntry(
     string Path,
     string Title,
     string SongName,
+    string LevelPath,
+    string LevelId,
     string ArtistName,
     DateTime RecordedAtUtc,
     int HitCount,

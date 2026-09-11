@@ -6,6 +6,12 @@ namespace Replay.Mobile;
 
 internal sealed class ReplayStore
 {
+    private const long MaximumJsonFileSize = 64L * 1024L * 1024L;
+    private const int MaximumCollectionCount = 2_000_000;
+    private const int MaximumTextLength = 1 * 1024 * 1024;
+    private const int MaximumBindingLength = 256;
+    private const long MaximumInputTimeMilliseconds = 86_400_000L;
+
     private readonly string _modDirectory;
 
     internal ReplayStore(string modDirectory)
@@ -67,12 +73,12 @@ internal sealed class ReplayStore
             return rpl2Replay;
         }
 
+        if (stream.Length > MaximumJsonFileSize)
+            throw new InvalidDataException("JSON 回放文件超过 64 MB 限制。");
+
         int first = ReadFirstContentByte(stream);
         if (first != '{')
-        {
-            stream.Position = 0;
-            return LegacyReplayReader.Load(stream);
-        }
+            throw new InvalidDataException("不是 Replay Mobile 的 .rpl 或 .rpl2 回放文件。");
 
         stream.Position = 0;
         ReplayData? replay = JsonSerializer.Deserialize(stream, ReplayJsonContext.Default.ReplayData);
@@ -121,6 +127,8 @@ internal sealed class ReplayStore
                     path,
                     replay.Title,
                     replay.SongName,
+                    replay.LevelPath,
+                    replay.LevelId,
                     replay.ArtistName,
                     replay.RecordedAtUtc,
                     replay.Hits.Count,
@@ -140,6 +148,8 @@ internal sealed class ReplayStore
                     path,
                     "",
                     Path.GetFileNameWithoutExtension(path),
+                    "",
+                    "",
                     "",
                     File.GetLastWriteTimeUtc(path),
                     0,
@@ -189,11 +199,21 @@ internal sealed class ReplayStore
 
     private static void Validate(ReplayData replay)
     {
+        if (replay == null)
+            throw new InvalidDataException("回放数据为空。");
         if (replay.FormatVersion is not (1 or 2))
             throw new InvalidDataException($"不支持回放格式版本 {replay.FormatVersion}。");
         replay.Hits ??= new List<ReplayHit>();
         replay.TouchEvents ??= new List<ReplayTouchInput>();
         replay.KeyboardEvents ??= new List<ReplayKeyboardInput>();
+        if (replay.Hits.Count > MaximumCollectionCount
+            || replay.TouchEvents.Count > MaximumCollectionCount
+            || replay.KeyboardEvents.Count > MaximumCollectionCount)
+        {
+            throw new InvalidDataException("回放事件数量过大。");
+        }
+
+        replay.ModVersion ??= "";
         replay.SongName = string.IsNullOrWhiteSpace(replay.SongName) ? "Unknown" : replay.SongName.Trim();
         replay.Title = NormalizeTitle(replay.Title);
         replay.ArtistName ??= "";
@@ -203,6 +223,14 @@ internal sealed class ReplayStore
         replay.SessionId = string.IsNullOrWhiteSpace(replay.SessionId)
             ? Guid.NewGuid().ToString("N")
             : replay.SessionId;
+        EnsureTextLength(replay.ModVersion, "ModVersion");
+        EnsureTextLength(replay.SessionId, "SessionId");
+        EnsureTextLength(replay.SongName, "SongName");
+        EnsureTextLength(replay.Title, "Title");
+        EnsureTextLength(replay.ArtistName, "ArtistName");
+        EnsureTextLength(replay.LevelPath, "LevelPath");
+        EnsureTextLength(replay.SceneName, "SceneName");
+        EnsureTextLength(replay.LevelId, "LevelId");
         if (replay.StartTile < 0 || replay.EndTile < replay.StartTile)
             throw new InvalidDataException("回放瓦片范围无效。");
         if (replay.TotalTiles <= 0)
@@ -210,41 +238,67 @@ internal sealed class ReplayStore
         if (replay.Hits.Count == 0)
             throw new InvalidDataException("回放中没有判定记录。");
 
+        int previousSequence = -1;
+        foreach (ReplayHit? hit in replay.Hits)
+        {
+            if (hit == null)
+                throw new InvalidDataException("回放包含空判定记录。");
+            if (hit.SequenceId < 0 || hit.SequenceId < previousSequence)
+                throw new InvalidDataException("回放判定序号不是递增顺序。");
+            if (!double.IsFinite(hit.HitAngleOffset))
+                throw new InvalidDataException("回放判定角度无效。");
+            if ((uint)hit.HitMargin > 11u)
+                throw new InvalidDataException("回放判定等级无效。");
+            previousSequence = hit.SequenceId;
+        }
+
         for (int index = replay.TouchEvents.Count - 1; index >= 0; index--)
         {
-            ReplayTouchInput input = replay.TouchEvents[index];
+            ReplayTouchInput? input = replay.TouchEvents[index];
             if (input == null)
+                throw new InvalidDataException("回放包含空触摸记录。");
+            if (input.TimeMilliseconds < 0L
+                || input.TimeMilliseconds > MaximumInputTimeMilliseconds
+                || input.Action < 0
+                || input.PointerId < -1
+                || !float.IsFinite(input.X)
+                || !float.IsFinite(input.Y)
+                || !float.IsFinite(input.SourceWidth)
+                || !float.IsFinite(input.SourceHeight)
+                || input.SourceWidth < 0f
+                || input.SourceHeight < 0f)
             {
-                replay.TouchEvents.RemoveAt(index);
-                continue;
+                throw new InvalidDataException("回放触摸记录无效。");
             }
-            input.TimeMilliseconds = Math.Clamp(input.TimeMilliseconds, 0L, 86_400_000L);
-            input.X = float.IsFinite(input.X) ? input.X : 0f;
-            input.Y = float.IsFinite(input.Y) ? input.Y : 0f;
-            input.SourceWidth = float.IsFinite(input.SourceWidth) && input.SourceWidth > 0f
-                ? input.SourceWidth
-                : 0f;
-            input.SourceHeight = float.IsFinite(input.SourceHeight) && input.SourceHeight > 0f
-                ? input.SourceHeight
-                : 0f;
         }
+        replay.TouchEvents = replay.TouchEvents
+            .OrderBy(input => input.TimeMilliseconds)
+            .ToList();
 
         for (int index = replay.KeyboardEvents.Count - 1; index >= 0; index--)
         {
-            ReplayKeyboardInput input = replay.KeyboardEvents[index];
+            ReplayKeyboardInput? input = replay.KeyboardEvents[index];
             if (input == null || string.IsNullOrWhiteSpace(input.Binding))
+                throw new InvalidDataException("回放键盘记录无效。");
+            if (input.TimeMilliseconds < 0L
+                || input.TimeMilliseconds > MaximumInputTimeMilliseconds
+                || input.Action is < 0 or > 1
+                || input.Repeat < 0
+                || input.Binding.Length > MaximumBindingLength)
             {
-                replay.KeyboardEvents.RemoveAt(index);
-                continue;
+                throw new InvalidDataException("回放键盘记录无效。");
             }
-            input.TimeMilliseconds = Math.Clamp(input.TimeMilliseconds, 0L, 86_400_000L);
             input.Binding = input.Binding.Trim();
-            input.Action = input.Action == 1 ? 1 : 0;
-            input.Repeat = Math.Max(0, input.Repeat);
         }
         replay.KeyboardEvents = replay.KeyboardEvents
             .OrderBy(input => input.TimeMilliseconds)
             .ToList();
+    }
+
+    private static void EnsureTextLength(string value, string field)
+    {
+        if (value.Length > MaximumTextLength)
+            throw new InvalidDataException($"回放 {field} 字段过长。");
     }
 
     private static string SanitizeFileName(string value)

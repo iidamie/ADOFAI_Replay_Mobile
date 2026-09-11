@@ -15,6 +15,8 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
     private const string LogTag = "Replay";
     private const int PlayerControlState = 4;
     private const int StableIdentityTicksRequired = 20;
+    private const float ChartCoverRotationSpeedDegreesPerSecond = 30f;
+    private const int ChartCoverSegmentCount = 64;
     private static readonly TimeSpan CustomLevelBrowserTimeout = TimeSpan.FromSeconds(60);
 
     private readonly object _stateLock = new();
@@ -22,6 +24,8 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
     private readonly HashSet<string> _autoSavedSessions = new(StringComparer.Ordinal);
 
     private GameApi? _game;
+    private ReplayChartPreview? _replayChartPreview;
+    private ReplayAudioPreview? _replayAudioPreview;
     private ReplayStore? _store;
     private GitHubUpdateService? _updateService;
     private ReplayData? _currentAttempt;
@@ -50,6 +54,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
     private string _selectedReplayPath = "";
     private string _editingReplayPath = "";
     private string _replayTitleEdit = "";
+    private string _managerPreviewKey = "";
     private string _fileSearch = "";
     private string _pendingDeletePath = "";
     private bool _recording;
@@ -59,6 +64,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
     private bool _editorHooksInstalled;
     private bool _renderErrorLogged;
     private bool _loaded;
+    private bool _customReplayExitRedirectPending;
     private bool _touchInputSubscribed;
     private bool _keyboardInputActive;
     private bool _managerOpen;
@@ -79,6 +85,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
     private bool _saveEveryCompletion;
     private bool _saveEveryFailure;
     private bool _saveFailureAt90Percent = true;
+    private bool _disableTutorialAutoSave = true;
     private bool _ignoreAutoplay = true;
     private bool _showReplayHud = true;
     private bool _receiveTouchInput = true;
@@ -146,32 +153,139 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
     {
         string assemblyPath = Assembly.GetExecutingAssembly().Location;
         string modDirectory = Path.GetDirectoryName(assemblyPath) ?? AppContext.BaseDirectory;
-        _store = new ReplayStore(modDirectory);
-        LoadSettings();
-        _game = GameApi.Create();
-        if (_game == null)
-            throw new InvalidOperationException("ADOFAI IL2CPP runtime or Assembly-CSharp was not found");
+        try
+        {
+            _store = new ReplayStore(modDirectory);
+            LoadSettings();
+            _game = GameApi.Create();
+            if (_game == null)
+                throw new InvalidOperationException("ADOFAI IL2CPP runtime or Assembly-CSharp was not found");
+            _replayChartPreview = new ReplayChartPreview(_game.RuntimeDomain, _game.GameAssembly);
+            _replayAudioPreview = new ReplayAudioPreview(_game.RuntimeDomain, _game.GameAssembly);
 
-        Logger.Info(
-            LogTag,
-            $"Runtime custom-level loader available: {_game.CanLoadScenes}");
-        _languageCode = _game.GetLanguageCode();
-        if (!GameHooks.Install(this, _game))
+            Logger.Info(
+                LogTag,
+                $"Runtime custom-level loader available: {_game.CanLoadScenes}");
+            _languageCode = _game.GetLanguageCode();
+            if (!GameHooks.Install(this, _game))
+                throw new InvalidOperationException("Required Replay IL2CPP hooks could not be installed");
+            _loaded = true;
+            SyncInputReceivers();
+            CustomLoadDiagnostics.Install(this);
+            _updateService = new GitHubUpdateService(modDirectory, Version);
+            _updateService.StartAutomaticCheck();
+
+            RefreshFiles();
+            nint controller = _game.GetController();
+            if (_game.IsGameWorld(controller))
+                QueueAttemptStart(controller, _game.GetCurrentSequence(controller));
+            Logger.Info(
+                LogTag,
+                $"Loaded for StArray.ModManager 1.0.4+; version={Version}");
+        }
+        catch (Exception exception)
+        {
+            Logger.Error(LogTag, $"Replay load failed; rolling back initialization: {exception}");
+            RollbackLoad();
+            throw;
+        }
+    }
+
+    private void RollbackLoad()
+    {
+        _loaded = false;
+        TryRollbackLoadStep("input receivers", SyncInputReceivers);
+        TryRollbackLoadStep("updater", () =>
+        {
+            try
+            {
+                _updateService?.Dispose();
+            }
+            finally
+            {
+                _updateService = null;
+            }
+        });
+        TryRollbackLoadStep("keyboard hook", ReplayKeyboardHook.Uninstall);
+        TryRollbackLoadStep("keyboard recorder", ReplayKeyboardRecorder.Reset);
+        TryRollbackLoadStep("replay input playback", EndReplayInputPlayback);
+        TryRollbackLoadStep("editor hooks", EditorSupport.Uninstall);
+        TryRollbackLoadStep("custom load diagnostics", CustomLoadDiagnostics.Uninstall);
+        TryRollbackLoadStep("game hooks", GameHooks.Uninstall);
+        TryRollbackLoadStep("preview audio", () =>
+        {
+            try
+            {
+                _replayAudioPreview?.Dispose();
+            }
+            finally
+            {
+                _replayAudioPreview = null;
+            }
+        });
+        TryRollbackLoadStep("preview chart", () =>
+        {
+            try
+            {
+                _replayChartPreview?.Dispose();
+            }
+            finally
+            {
+                _replayChartPreview = null;
+            }
+        });
+        _commands.Clear();
+
+        lock (_stateLock)
         {
             _game = null;
-            throw new InvalidOperationException("Required Replay IL2CPP hooks could not be installed");
+            _store = null;
+            _currentAttempt = null;
+            _lastAttempt = null;
+            _activeReplay = null;
+            _pendingReplay = null;
+            _resultAttempt = null;
+            _files.Clear();
+            _controller = 0;
+            _player = 0;
+            _recording = false;
+            _pendingAttemptController = 0;
+            _pendingAttemptStartTile = -1;
+            _pendingIdentity = null;
+            _identityStableTicks = 0;
+            _levelTransitionInProgress = false;
+            _editorPlayRequested = false;
+            _editorFinalized = false;
+            _editorHooksInstalled = false;
+            _customReplayExitRedirectPending = false;
+            _touchInputSubscribed = false;
+            _keyboardInputActive = false;
+            _managerOpen = false;
+            _managerShowingDetails = false;
+            _managerPausedGame = false;
+            _resultAttemptSaved = false;
+            _resultSaveQueued = false;
+            _autoSavedSessions.Clear();
+            _runState = ReplayRunState.Idle;
+            _loadStage = ReplayLoadStage.None;
+            _loadDeadlineUtc = default;
+            _recordingStartTicks = 0;
+            _replayClockStartTicks = 0;
+            _replayPausedTicks = 0;
+            _replayPauseStartTicks = 0;
         }
-        _loaded = true;
-        SyncInputReceivers();
-        CustomLoadDiagnostics.Install(this);
-        _updateService = new GitHubUpdateService(modDirectory, Version);
-        _updateService.StartAutomaticCheck();
+    }
 
-        RefreshFiles();
-        nint controller = _game.GetController();
-        if (_game.IsGameWorld(controller))
-            QueueAttemptStart(controller, _game.GetCurrentSequence(controller));
-        Logger.Info(LogTag, "Loaded for StArray.ModManager 1.0.4+");
+    private void TryRollbackLoadStep(string stage, Action action)
+    {
+        try
+        {
+            action();
+        }
+        catch (Exception exception)
+        {
+            Logger.Error(LogTag, $"Replay load rollback failed at {stage}: {exception}");
+        }
     }
 
     public void OnUnload()
@@ -192,11 +306,20 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
         catch
         {
         }
-        if (_editorHooksInstalled)
+        try
         {
-            EditorSupport.Uninstall();
-            _editorHooksInstalled = false;
+            _replayAudioPreview?.Dispose();
+            _replayChartPreview?.Dispose();
         }
+        catch
+        {
+        }
+        _replayAudioPreview = null;
+        _replayChartPreview = null;
+        // Detach is used for scene changes, but unloading the mod must always
+        // remove the native editor detours as well.
+        EditorSupport.Uninstall();
+        _editorHooksInstalled = false;
         CustomLoadDiagnostics.Uninstall();
         GameHooks.Uninstall();
         lock (_stateLock)
@@ -233,31 +356,46 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
 
     public void OnForegroundGUI(ImDrawListPtr drawList)
     {
-        try
+        TryRenderForeground("input receivers", SyncInputReceivers);
+        if (_keyboardInputActive)
+            TryRenderForeground("keyboard input", () => ReplayKeyboardRecorder.Update(this));
+        TryRenderForeground(
+            "update notification",
+            () => _updateService?.DrawForegroundNotification());
+        TryRenderForeground("input display size", () =>
         {
-            SyncInputReceivers();
-            if (_keyboardInputActive)
-                ReplayKeyboardRecorder.Update(this);
-            _updateService?.DrawForegroundNotification();
             Vector2 display = ImGui.GetIO().DisplaySize;
             if (display.X > 1f && display.Y > 1f)
             {
                 Volatile.Write(ref _inputDisplayWidth, Math.Max(0, (int)MathF.Round(display.X)));
                 Volatile.Write(ref _inputDisplayHeight, Math.Max(0, (int)MathF.Round(display.Y)));
             }
-            DrawHud(drawList);
-            DrawReplayControls();
-            DrawResultSaveButton();
-            DrawIslandEntry();
-            DrawReplayManager();
-            DrawToast();
+        });
+
+        // Keep independent overlays alive if a transient native scene object
+        // is unavailable during a 3.1.2/3.3.1 transition. Previously one
+        // exception set _renderErrorLogged and returned from every later
+        // frame, which made the home entry appear once and then vanish.
+        TryRenderForeground("replay HUD", () => DrawHud(drawList));
+        TryRenderForeground("replay controls", DrawReplayControls);
+        TryRenderForeground("result save button", DrawResultSaveButton);
+        TryRenderForeground("main entry", DrawIslandEntry);
+        TryRenderForeground("replay manager", DrawReplayManager);
+        TryRenderForeground("toast", DrawToast);
+    }
+
+    private void TryRenderForeground(string section, Action draw)
+    {
+        try
+        {
+            draw();
         }
         catch (Exception exception)
         {
             if (_renderErrorLogged)
                 return;
             _renderErrorLogged = true;
-            Logger.Error(LogTag, $"HUD render failed: {exception}");
+            Logger.Error(LogTag, $"Foreground {section} render failed: {exception}");
         }
     }
 
@@ -324,7 +462,10 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
     {
         Interlocked.Exchange(ref _lastSettingsGuiTick, Environment.TickCount64);
         NormalizeSettings();
-        TickConductorMainThread();
+        // UI callbacks can run on ModManager's managed/render thread. Native
+        // scene transitions, especially LoadCustomLevel, must be initiated
+        // from Replay's controller/conductor hooks on the Unity game thread.
+        // The queued command is consumed by TickMainThread there.
         UiText ui = UiText.FromLanguage(_languageCode);
         if (!string.Equals(_lastScannedDirectory, _replayDirectory, StringComparison.Ordinal))
             RefreshFiles();
@@ -334,17 +475,23 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             ImGui.TextWrapped(status);
         ShowNotice();
 
-        ImGui.Separator();
-        if (ImGui.Button(ui.OpenManager))
-            OpenReplayManager();
+        // 编辑器内不提供打开回放管理器的快捷按钮；编辑器的播放/编辑
+        // 控件由游戏自身处理，避免在编辑器画布上叠加 Replay 入口。
+        if (_game?.IsEditorScene() != true)
+        {
+            ImGui.Separator();
+            if (ImGui.Button(ui.OpenManager))
+                OpenReplayManager();
 
-        ImGui.Separator();
+            ImGui.Separator();
+        }
         ImGui.TextUnformatted(ui.SaveOptions);
         bool settingsChanged = false;
         settingsChanged |= ImGui.Checkbox(ui.SaveFullClear, ref _saveFullClear);
         settingsChanged |= ImGui.Checkbox(ui.SaveEveryCompletion, ref _saveEveryCompletion);
         settingsChanged |= ImGui.Checkbox(ui.SaveEveryFailure, ref _saveEveryFailure);
         settingsChanged |= ImGui.Checkbox(ui.SaveFailureAt90Percent, ref _saveFailureAt90Percent);
+        settingsChanged |= ImGui.Checkbox(ui.DisableTutorialAutoSave, ref _disableTutorialAutoSave);
         settingsChanged |= ImGui.Checkbox(ui.DisableAutoReplay, ref _ignoreAutoplay);
         settingsChanged |= ImGui.Checkbox(ui.ShowHud, ref _showReplayHud);
         settingsChanged |= ImGui.Checkbox(ui.ReceiveTouchInput, ref _receiveTouchInput);
@@ -392,7 +539,12 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
     internal bool ShouldBlockPlayerHit(nint player)
     {
         lock (_stateLock)
-            return _activeReplay != null || _managerOpen;
+        {
+            if (_managerOpen || _activeReplay == null)
+                return _managerOpen;
+
+            return true;
+        }
     }
 
     internal bool ShouldBlockInput()
@@ -400,10 +552,11 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
         lock (_stateLock)
         {
             return _managerOpen
-                || _activeReplay != null && _runState is ReplayRunState.Playing
-                    or ReplayRunState.Paused
-                    or ReplayRunState.Finished
-                    or ReplayRunState.Failed;
+                || _activeReplay != null
+                    && (_runState == ReplayRunState.Playing
+                        || _runState == ReplayRunState.Paused
+                        || _runState == ReplayRunState.Finished
+                        || _runState == ReplayRunState.Failed);
         }
     }
 
@@ -481,6 +634,32 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
         }
     }
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    private static ReplayHit CloneHit(ReplayHit source)
+        => new()
+        {
+            SequenceId = source.SequenceId,
+            HitAngleOffset = source.HitAngleOffset,
+            HitMargin = source.HitMargin,
+            NoFailHit = source.NoFailHit,
+            AutoHit = source.AutoHit,
+        };
+
     internal int GetStartTile(int requestedSequence)
     {
         lock (_stateLock)
@@ -534,6 +713,10 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
         _controller = controller;
         _levelTransitionInProgress = false;
         _editorFinalized = false;
+
+        if (_game.IsEditorScene())
+            ArmEditorRecordingFromStartRewind();
+
         bool activated = false;
         bool restarted = false;
 
@@ -581,6 +764,30 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
 
         if (QueueAttemptStart(controller, sequenceId))
             SetRecordingAnchor(Stopwatch.GetTimestamp());
+    }
+
+    private void ArmEditorRecordingFromStartRewind()
+    {
+        lock (_stateLock)
+        {
+            // A pending/active replay owns this Start_Rewind event. Do not
+            // turn an editor replay playback into a fresh recording attempt.
+            if (_activeReplay != null || _pendingReplay != null)
+                return;
+
+            _editorPlayRequested = true;
+            _editorFinalized = false;
+            _levelTransitionInProgress = false;
+            _currentAttempt = null;
+            _recording = false;
+            _pendingAttemptController = 0;
+            _pendingAttemptStartTile = -1;
+            _pendingIdentity = null;
+            _identityStableTicks = 0;
+        }
+        Logger.Info(
+            LogTag,
+            "Editor Start_Rewind received; editor recording armed without playMode polling");
     }
 
     internal void HandleLevelLoadStarted(nint controller)
@@ -668,6 +875,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
         EndReplayInputPlayback();
         Logger.Info(LogTag, "Editor reset — cleared editor play state");
     }
+
     private void UpdateEditorHooks()
     {
         bool inEditor = _game?.IsEditorScene() == true;
@@ -679,8 +887,13 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
         }
         else if (!inEditor && _editorHooksInstalled)
         {
-            EditorSupport.Uninstall();
+            // Keep the native editor detours installed while the mod remains
+            // loaded. Only detach this plugin instance between scene visits;
+            // OnUnload/RollbackLoad performs the real unhook.
+            EditorSupport.Detach();
             _editorHooksInstalled = false;
+            if (_editorPlayRequested)
+                HandleEditorReset();
             Logger.Info(LogTag, "Editor hooks uninstalled (left editor scene)");
         }
     }
@@ -721,11 +934,25 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
                 case ReplayCommandKind.ResumeAfterManager:
                     ResumeAfterReplayManagerNow();
                     break;
+                case ReplayCommandKind.StartPreview when command.AudioPreview != null:
+                    StartReplayAudioPreviewNow(command.AudioPreview);
+                    break;
+                case ReplayCommandKind.StopPreview:
+                    StopReplayAudioPreviewNow();
+                    break;
+                case ReplayCommandKind.SetOfficialPreview:
+                    _replayChartPreview?.SetOfficialLevel(command.OfficialLevelId);
+                    break;
             }
         }
+        TickReplayAudioPreview();
         AdvancePendingReplayLoad();
         EnsureAttemptStarted(controller);
     }
+
+
+
+
 
     private void AdvancePendingReplayLoad()
     {
@@ -773,9 +1000,14 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
                 return;
             _loadStage = ReplayLoadStage.WaitingForTargetStart;
             _loadDeadlineUtc = default;
+            _customReplayExitRedirectPending = IsCustomReplayExitCandidate(replay);
         }
         Logger.Info(LogTag, $"Replay custom level opened via {game?.LastLoadRoute}: {game?.GetReplayLoadState()}");
     }
+
+
+
+
 
     private void FailPendingReplayLoad(string error)
     {
@@ -788,6 +1020,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             _runState = ReplayRunState.Idle;
             _loadStage = ReplayLoadStage.None;
             _loadDeadlineUtc = default;
+            _customReplayExitRedirectPending = false;
         }
         SetNotice(error);
         Logger.Error(LogTag, $"Could not load replay level: {error}");
@@ -823,6 +1056,8 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
         if (game == null)
             return;
 
+        nint controller = game.GetController();
+
         ReplayData? replay;
         ReplayRunState state;
         lock (_stateLock)
@@ -834,12 +1069,15 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             or ReplayRunState.Paused or ReplayRunState.Finished or ReplayRunState.Failed)
             return;
 
-        nint controller = game.GetController();
+        // A speed change rebuilds the native level through Replay's own
+        // Start_Rewind flow. PlayerControl may briefly report state 4 while
+        // the native Ready prompt is still waiting for the user's tap; do not
+        // let Replay consume network events during that transient window.
         nint player = game.GetPlayer(controller);
         // 编辑器模式下 player 和 state 均不可靠，全部跳过。
         bool editorReplay;
         lock (_stateLock)
-            editorReplay = replay.SceneName == "scnEditor";
+            editorReplay = IsEditorReplay(replay);
         if (!game.IsGameWorld(controller))
             return;
         // Start_Rewind 在 scnEditor.Play() 内部触发，但编辑器预览页的 controller
@@ -849,8 +1087,11 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             return;
         if (!editorReplay)
         {
-            if (player == 0) return;
-            if (game.GetControllerState(controller) != PlayerControlState) return;
+            if (player == 0)
+                return;
+            int controllerState = game.GetControllerState(controller);
+            if (controllerState != PlayerControlState)
+                return;
         }
         if (game.IsPaused(controller))
         {
@@ -862,7 +1103,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
         _player = player;
         // 编辑器 currentState 始终为 None，playMode 又会在倒计时前提前为 true。
         // hasSongStarted 由 scrConductor.Rewind 清零，并在真正调度音乐后置位，
-        // 是不会提前消费回放输入的可靠开闸信号。
+        // 是不会提前消费编辑器回放输入的可靠开闸信号。
         if (editorReplay && !game.HasSongStarted())
             return;
         if (state == ReplayRunState.WaitingForStart)
@@ -937,13 +1178,13 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             if (!midSpin)
                 game.SetPlanetAngle(planet, targetAngle);
             bool previousNoFail = game.SetNoFailInfinite(controller, hit.NoFailHit || midSpin);
+            int injectedMargin = midSpin || hit.AutoHit || hit.HitMargin is 7 or 10 or 11
+                ? 3
+                : hit.HitMargin;
             try
             {
                 // Final display judgements are not raw timing margins. Keep
                 // their recording while injecting a valid movement margin.
-                int injectedMargin = midSpin || hit.AutoHit || hit.HitMargin is 7 or 10 or 11
-                    ? 3
-                    : hit.HitMargin;
                 GameHooks.InjectPlayerHit(player, autoHit: true, injectedMargin);
             }
             finally
@@ -960,6 +1201,30 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             }
         }
     }
+
+    private int GetReplayIndex()
+    {
+        lock (_stateLock)
+            return _replayIndex;
+    }
+
+    private static int FindReplayIndexAtOrAfterSequence(ReplayData replay, int sequence)
+    {
+        if (replay.Hits == null || replay.Hits.Count == 0)
+            return 0;
+        for (int index = 0; index < replay.Hits.Count; index++)
+        {
+            if (replay.Hits[index].SequenceId >= sequence)
+                return index;
+        }
+        return replay.Hits.Count;
+    }
+
+
+
+
+
+
 
     private static bool AdvanceUnrecordedMidSpin(
         GameApi game,
@@ -1293,29 +1558,34 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
                 _recordingStartTicks = 0;
                 return null;
             }
+
+            _currentAttempt.Completed = completed;
+            _currentAttempt.EndTile = Math.Max(
+                _currentAttempt.EndTile,
+                Math.Max(0, game?.GetCurrentSequence(controller) ?? _currentAttempt.EndTile));
+
             if (_currentAttempt.Hits.Count == 0)
             {
                 Logger.Warn(LogTag, $"Recording ended without captured hits: {_currentAttempt.SongName}");
                 _currentAttempt = null;
                 _recording = false;
                 _recordingStartTicks = 0;
-                return null;
+                finalized = null;
             }
-
-            _currentAttempt.Completed = completed;
-            _currentAttempt.EndTile = Math.Max(
-                _currentAttempt.EndTile,
-                game?.GetCurrentSequence(controller) ?? _currentAttempt.EndTile);
-            _lastAttempt = CloneReplay(_currentAttempt);
-            finalized = CloneReplay(_lastAttempt);
-            _currentAttempt = null;
-            _recording = false;
-            _recordingStartTicks = 0;
-            // 编辑器模式下暂停自动录制，等下次 Start_Rewind 触发再恢复。
-            if (_editorPlayRequested)
-                _editorFinalized = true;
+            else
+            {
+                _lastAttempt = CloneReplay(_currentAttempt);
+                finalized = CloneReplay(_lastAttempt);
+                _currentAttempt = null;
+                _recording = false;
+                _recordingStartTicks = 0;
+                // 编辑器模式下暂停自动录制，等下次 Start_Rewind 触发再恢复。
+                if (_editorPlayRequested)
+                    _editorFinalized = true;
+            }
         }
         ReplayKeyboardRecorder.Reset();
+
         if (finalized == null)
             return null;
         Logger.Info(
@@ -1382,9 +1652,44 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
 
     private bool ShouldAutoSaveAttempt(ReplayData replay, float progress)
     {
+        if (_disableTutorialAutoSave && IsTutorialLevel(replay))
+            return false;
+
         return replay.Completed
             ? _saveEveryCompletion || _saveFullClear && replay.StartTile == 0
             : _saveEveryFailure || _saveFailureAt90Percent && progress >= 0.9f;
+    }
+
+    private static bool IsTutorialLevel(ReplayData replay)
+    {
+        if (replay.IsOfficialLevel)
+        {
+            string levelId = replay.LevelId?.Trim() ?? "";
+            int separator = levelId.LastIndexOfAny('/', '\\');
+            if (separator >= 0)
+                levelId = levelId[(separator + 1)..];
+            int extension = levelId.LastIndexOf('.');
+            if (extension > 0)
+                levelId = levelId[..extension];
+            return levelId.Length > 0
+                && levelId[^1] >= '0'
+                && levelId[^1] <= '9';
+        }
+
+        string fileName;
+        try
+        {
+            fileName = Path.GetFileNameWithoutExtension(replay.LevelPath ?? "");
+        }
+        catch
+        {
+            return false;
+        }
+
+        if (!fileName.StartsWith("sub", StringComparison.OrdinalIgnoreCase))
+            return false;
+        string suffix = fileName[3..];
+        return suffix.All(character => character >= '0' && character <= '9');
     }
 
     private bool AutoSave(ReplayData replay)
@@ -1485,6 +1790,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             ClearResultAttemptLocked();
             _activeReplay = null;
             _pendingReplay = pendingReplay;
+            _customReplayExitRedirectPending = false;
             _currentAttempt = null;
             _runState = ReplayRunState.Loading;
             _loadStage = ReplayLoadStage.WaitingForTargetStart;
@@ -1508,6 +1814,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
                 _runState = ReplayRunState.Idle;
                 _loadStage = ReplayLoadStage.None;
                 _loadDeadlineUtc = default;
+                _customReplayExitRedirectPending = false;
             }
             string error = string.IsNullOrWhiteSpace(game.LastLoadError)
                 ? UiText.FromLanguage(_languageCode).LoadFailed
@@ -1519,11 +1826,14 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
         lock (_stateLock)
         {
             if (ReferenceEquals(_pendingReplay, pendingReplay))
+            {
                 _loadStage = game.WaitingForCustomLevelBrowser
                     ? ReplayLoadStage.WaitingForCustomLevelBrowser
                     : game.WaitingForLevelSelect
                         ? ReplayLoadStage.WaitingForLevelSelect
                         : ReplayLoadStage.WaitingForTargetStart;
+                _customReplayExitRedirectPending = IsCustomReplayExitCandidate(pendingReplay);
+            }
         }
         Logger.Info(LogTag, $"Replay load requested via {game.LastLoadRoute}: {game.GetReplayLoadState()}");
     }
@@ -1578,10 +1888,29 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             _loadDeadlineUtc = default;
             _editorPlayRequested = false;
             _editorFinalized = false;
+            _customReplayExitRedirectPending = false;
             _managerPausedGame = false;
         }
         if (resumeRecording && game?.IsGameWorld(controller) == true && !game.IsEditorScene())
             QueueAttemptStart(controller, game.GetCurrentSequence(controller));
+    }
+
+    internal bool HandleCustomReplayQuit(nint controller)
+    {
+        bool customReplay;
+        lock (_stateLock)
+        {
+            customReplay = _customReplayExitRedirectPending && !_editorPlayRequested;
+            if (customReplay)
+                _customReplayExitRedirectPending = false;
+        }
+        if (!customReplay)
+            return false;
+
+        StopPlaybackNow(resumeRecording: false);
+        _game?.ReleaseCustomLevelState();
+        Logger.Info(LogTag, "拦截用户退出自定义谱回放，已清理自定义谱状态并继续调用 QuitToMainMenu。");
+        return true;
     }
 
     private void RefreshFiles()
@@ -1604,6 +1933,94 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
     private ReplayStore RequireStore()
     {
         return _store ?? throw new InvalidOperationException("Replay storage is not initialized");
+    }
+
+    private void StartReplayAudioPreviewNow(ReplayChartAudioPreview preview)
+    {
+        ReplayAudioPreview? audio = _replayAudioPreview;
+        GameApi? game = _game;
+        if (audio == null || game == null)
+            return;
+        try
+        {
+            audio.Start(preview, game.GetConductor());
+        }
+        catch (Exception exception)
+        {
+            Logger.Debug(LogTag, "启动回放管理器预览音乐失败: " + exception.Message);
+            audio.Stop();
+        }
+    }
+
+    private void StopReplayAudioPreviewNow()
+    {
+        try { _replayAudioPreview?.Stop(); }
+        catch (Exception exception)
+        {
+            Logger.Debug(LogTag, "停止回放管理器预览音乐失败: " + exception.Message);
+        }
+    }
+
+    private void TickReplayAudioPreview()
+    {
+        ReplayAudioPreview? audio = _replayAudioPreview;
+        if (audio == null || !audio.IsActive)
+            return;
+        try { audio.Tick(); }
+        catch (Exception exception)
+        {
+            Logger.Debug(LogTag, "推进回放管理器预览音乐失败: " + exception.Message);
+            audio.Stop();
+        }
+    }
+
+    private void EnsureManagerPreview(ReplayFileEntry selected)
+    {
+        string sourcePath = selected.LevelPath?.Trim() ?? "";
+        string key = selected.Path + "\n" + sourcePath;
+        if (string.Equals(_managerPreviewKey, key, StringComparison.OrdinalIgnoreCase))
+            return;
+
+        string chartPath = ReplayChartMetadata.ResolveChartFile(sourcePath) ?? "";
+        _managerPreviewKey = key;
+        _commands.Enqueue(new ReplayCommand(ReplayCommandKind.StopPreview));
+
+        if (selected.IsOfficialLevel)
+        {
+            _replayChartPreview?.Clear();
+            Logger.Info(
+                LogTag,
+                "请求显示官谱封面: levelId='" + selected.LevelId
+                + "', replay='" + selected.Path + "'");
+            _commands.Enqueue(new ReplayCommand(
+                ReplayCommandKind.SetOfficialPreview,
+                OfficialLevelId: selected.LevelId));
+            return;
+        }
+
+        _replayChartPreview?.SetChart(chartPath);
+        if (string.IsNullOrWhiteSpace(chartPath))
+            return;
+        ReplayChartAudioPreview? audio = ReplayChartMetadata.ReadAudioPreview(chartPath);
+        if (audio != null)
+        {
+            _commands.Enqueue(new ReplayCommand(
+                ReplayCommandKind.StartPreview,
+                AudioPreview: audio));
+        }
+        else
+        {
+            Logger.Debug(LogTag, "回放对应谱面没有可用的预览音乐: " + chartPath);
+        }
+    }
+
+    private void StopManagerPreview()
+    {
+        bool pending = !string.IsNullOrWhiteSpace(_managerPreviewKey);
+        _managerPreviewKey = "";
+        _replayChartPreview?.Clear();
+        if (pending || _replayAudioPreview?.IsActive == true)
+            _commands.Enqueue(new ReplayCommand(ReplayCommandKind.StopPreview));
     }
 
     private void OpenReplayManager()
@@ -1635,6 +2052,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             _editingReplayPath = "";
             _replayTitleEdit = "";
         }
+        StopManagerPreview();
         if (resume)
             _commands.Enqueue(new ReplayCommand(ReplayCommandKind.ResumeAfterManager));
     }
@@ -1685,24 +2103,24 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
     {
         GameApi? game = _game;
         bool customLevelSelect = game?.IsCustomLevelSelect() == true;
-        bool editorScene = !customLevelSelect && string.Equals(
-            game?.GetSceneName(), "scnEditor", StringComparison.OrdinalIgnoreCase);
-        if (editorScene && game?.IsEditorPlayMode() == true)
+        bool editorScene = !customLevelSelect && game?.IsEditorScene() == true;
+        if (editorScene)
         {
-            // 真正游玩时隐藏入口；失败/通关释放回放，或用户主动停止回放后，
-            // 即使编辑器尚未切回预览也重新显示，允许不重进编辑器再次选择回放。
-            lock (_stateLock)
-                editorScene = _activeReplay == null
-                    && _pendingReplay == null
-                    && !_recording
-                    && !_editorPlayRequested;
+            // 编辑器内不显示回放管理入口。编辑器的开始/停止由游戏自身
+            // 的编辑器按钮处理，避免入口遮挡编辑器并误触发管理页面。
+            _islandEntryLogged = false;
+            return;
         }
-        bool entryScene = customLevelSelect || game?.IsLevelSelect() == true || editorScene;
+        bool entryScene = customLevelSelect || game?.IsLevelSelect() == true;
         if (!entryScene)
             _islandEntryLogged = false;
-        long settingsAge = Environment.TickCount64 - Interlocked.Read(ref _lastSettingsGuiTick);
         ImGuiIOPtr io = ImGui.GetIO();
-        if (!entryScene || game == null || _managerOpen || settingsAge < 250 || io.WantTextInput)
+        // On 3.1.2 the manager settings callback can remain active while the
+        // main manager window is hidden. The entry has its own window id and
+        // is already hidden when ReplayManager is open, so it must not depend
+        // on either the settings callback timestamp or a stale WantTextInput
+        // flag from the mobile keyboard.
+        if (!entryScene || game == null || _managerOpen)
             return;
 
         UiText ui = UiText.FromLanguage(_languageCode);
@@ -1717,9 +2135,8 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             + style.WindowPadding.X * 2f;
         float width = ClampOverlayWidth(display.X, margin, 180f, desiredWidth);
         Vector2 size = new(width, GetOverlayWindowHeight(buttonHeight));
-        // 编辑器左上角，其余场景右下角
-        float posX = editorScene ? margin : display.X - size.X - margin;
-        float posY = editorScene ? margin : display.Y - size.Y - margin;
+        float posX = display.X - size.X - margin;
+        float posY = display.Y - size.Y - margin;
         ImGui.SetNextWindowPos(new Vector2(posX, posY), ImGuiCond.Always);
         ImGui.SetNextWindowSize(size, ImGuiCond.Always);
         ImGui.SetNextWindowBgAlpha(0.88f);
@@ -1739,8 +2156,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             _islandEntryLogged = true;
             Logger.Info(
                 LogTag,
-                editorScene ? "Replay editor entry is available"
-                    : customLevelSelect ? "Replay custom-level-page entry is available"
+                customLevelSelect ? "Replay custom-level-page entry is available"
                     : "Replay main-page entry is available");
         }
     }
@@ -1969,6 +2385,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             else
             {
                 _managerShowingDetails = false;
+                StopManagerPreview();
                 DrawReplayListPage(ui, files, ref open);
             }
         }
@@ -2083,6 +2500,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             _managerShowingDetails = false;
             _pendingDeletePath = "";
             _deletePopupRequested = false;
+            StopManagerPreview();
         }
         ImGui.SameLine();
         if (ImGui.Button(ui.Close, new Vector2(buttonWidth, buttonHeight)))
@@ -2101,6 +2519,65 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
 
     private void DrawReplayDetails(UiText ui, ReplayFileEntry selected)
     {
+        if (!selected.Supported)
+        {
+            DrawReplayDetailsInfo(ui, selected);
+        }
+        else
+        {
+            Vector2 available = ImGui.GetContentRegionAvail();
+            if (available.X < 860f)
+            {
+                DrawReplayDetailsInfo(ui, selected);
+                ImGui.Separator();
+                DrawReplayChartPreview(ui, selected);
+            }
+            else
+            {
+                ImGuiStylePtr style = ImGui.GetStyle();
+                float spacing = style.ItemSpacing.X;
+                float coverWidth = Math.Min(420f, Math.Max(280f, available.X * 0.34f));
+                float infoWidth = Math.Max(1f, available.X - coverWidth - spacing);
+                Vector2 rowStart = ImGui.GetCursorScreenPos();
+
+                ImGui.BeginGroup();
+                ImGui.PushTextWrapPos(rowStart.X + infoWidth);
+                DrawReplayDetailsInfo(ui, selected, infoWidth);
+                ImGui.PopTextWrapPos();
+                ImGui.EndGroup();
+                Vector2 infoBottom = ImGui.GetItemRectMax();
+
+                ImGui.SetCursorScreenPos(new Vector2(
+                    rowStart.X + infoWidth + spacing,
+                    rowStart.Y));
+                ImGui.BeginGroup();
+                DrawReplayChartPreview(ui, selected);
+                ImGui.EndGroup();
+                Vector2 coverBottom = ImGui.GetItemRectMax();
+
+                // Anchor the full-width action area after the taller of the
+                // summary and cover. The shared spacer below adds the visual gap.
+                ImGui.SetCursorScreenPos(new Vector2(
+                    rowStart.X,
+                    Math.Max(infoBottom.Y, coverBottom.Y)));
+            }
+        }
+
+        // Keep the action section visibly separated from whichever column is
+        // taller. The row is already anchored to max(summaryBottom,
+        // coverBottom) above; this explicit gap prevents the separator and
+        // buttons from touching the last line of either column.
+        float actionGap = Math.Max(18f, ImGui.GetStyle().ItemSpacing.Y * 2.5f);
+        ImGui.Dummy(new Vector2(1f, actionGap));
+        ImGui.Separator();
+        DrawReplayDetailsActions(ui, selected);
+    }
+
+    private void DrawReplayDetailsInfo(
+        UiText ui,
+        ReplayFileEntry selected,
+        float progressWidth = -1f)
+    {
         DrawManagerSectionTitle(ui.Details);
         ImGui.TextWrapped(GetReplayDisplayTitle(selected));
         if (!string.IsNullOrWhiteSpace(selected.Title))
@@ -2111,12 +2588,23 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
         int startProgress = GetProgress(selected.StartTile, selected.TotalTiles);
         int endProgress = GetEndProgress(selected);
         ImGui.TextDisabled($"{ui.Progress}: {startProgress}% - {endProgress}%");
-        ImGui.ProgressBar(endProgress / 100f, new Vector2(-1f, 0f), $"{endProgress}%");
+        ImGui.ProgressBar(
+            endProgress / 100f,
+            new Vector2(progressWidth > 0f ? progressWidth : -1f, 0f),
+            $"{endProgress}%");
         ImGui.TextDisabled($"{ui.Inputs}: {selected.HitCount}");
         ImGui.TextDisabled($"{ui.Speed}: {selected.Speed:0.00}x");
         ImGui.TextDisabled($"{ui.Source}: {(selected.IsOfficialLevel ? ui.Official : ui.Custom)}");
+        DrawManagerMutedWrapped(
+            $"{ui.LevelPath}: "
+            + (string.IsNullOrWhiteSpace(selected.LevelPath) ? "—" : selected.LevelPath));
+    }
+
+    private void DrawReplayDetailsActions(UiText ui, ReplayFileEntry selected)
+    {
         if (!selected.Supported)
         {
+            StopManagerPreview();
             ImGui.TextWrapped(selected.Error ?? ui.Unsupported);
         }
         else
@@ -2185,6 +2673,86 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             }
         }
     }
+
+    private void DrawReplayChartPreview(
+        UiText ui,
+        ReplayFileEntry selected,
+        float maxDisplayHeight = 320f)
+    {
+        EnsureManagerPreview(selected);
+        DrawManagerSectionTitle(ui.ChartPreview);
+        ReplayChartPreview? preview = _replayChartPreview;
+        if (preview == null
+            || !preview.TryGetTexture(out nint textureId, out int width, out int height))
+        {
+            ImGui.TextDisabled(ui.PreviewUnavailable);
+            return;
+        }
+
+        Vector2 available = ImGui.GetContentRegionAvail();
+        float diameter = Math.Max(
+            1f,
+            Math.Min(Math.Max(available.X, 1f), Math.Max(1f, maxDisplayHeight)));
+        Vector2 min = ImGui.GetCursorScreenPos();
+        ImGui.Dummy(new Vector2(diameter, diameter));
+        DrawRotatingReplayCover(textureId, width, height, min, diameter);
+    }
+
+    private static void DrawRotatingReplayCover(
+        nint textureId,
+        int textureWidth,
+        int textureHeight,
+        Vector2 min,
+        float diameter)
+    {
+        Vector2 center = min + new Vector2(diameter * 0.5f);
+        float radius = diameter * 0.5f;
+        ImDrawListPtr drawList = ImGui.GetWindowDrawList();
+        uint shadow = ImGui.ColorConvertFloat4ToU32(new Vector4(0f, 0f, 0f, 0.30f));
+        drawList.AddCircleFilled(center, radius + 3f, shadow, ChartCoverSegmentCount);
+
+        double elapsedSeconds = Environment.TickCount64 / 1000d;
+        float rotation = (float)((elapsedSeconds * ChartCoverRotationSpeedDegreesPerSecond
+            % 360d) * (Math.PI / 180d));
+        float uRadius = textureWidth > textureHeight
+            ? textureHeight / (float)textureWidth * 0.5f
+            : 0.5f;
+        float vRadius = textureHeight > textureWidth
+            ? textureWidth / (float)textureHeight * 0.5f
+            : 0.5f;
+        Vector2 centerUv = new(0.5f, 0.5f);
+        Vector2 previousPoint = CirclePoint(center, radius, rotation);
+        Vector2 previousUv = CoverUv(0f, uRadius, vRadius);
+        for (int segment = 1; segment <= ChartCoverSegmentCount; segment++)
+        {
+            float angle = segment * (MathF.PI * 2f / ChartCoverSegmentCount);
+            Vector2 point = CirclePoint(center, radius, angle + rotation);
+            Vector2 uv = CoverUv(angle, uRadius, vRadius);
+            drawList.AddImageQuad(
+                (IntPtr)textureId,
+                center,
+                previousPoint,
+                point,
+                center,
+                centerUv,
+                previousUv,
+                uv,
+                centerUv);
+            previousPoint = point;
+            previousUv = uv;
+        }
+
+        uint rim = ImGui.ColorConvertFloat4ToU32(new Vector4(0.70f, 0.86f, 1f, 0.85f));
+        drawList.AddCircle(center, radius, rim, ChartCoverSegmentCount, 1.5f);
+    }
+
+    private static Vector2 CirclePoint(Vector2 center, float radius, float angle)
+        => center + new Vector2(MathF.Cos(angle), MathF.Sin(angle)) * radius;
+
+    private static Vector2 CoverUv(float angle, float uRadius, float vRadius)
+        => new(
+            0.5f + MathF.Cos(angle) * uRadius,
+            0.5f - MathF.Sin(angle) * vRadius);
 
     private static float GetManagerButtonHeight()
     {
@@ -2501,6 +3069,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             _saveEveryCompletion = currentSettings && settings.SaveEveryCompletion;
             _saveEveryFailure = currentSettings && settings.SaveEveryFailure;
             _saveFailureAt90Percent = !currentSettings || settings.SaveFailureAt90Percent;
+            _disableTutorialAutoSave = !currentSettings || settings.DisableTutorialAutoSave;
             _ignoreAutoplay = settings.IgnoreAutoplay;
             _showReplayHud = settings.ShowReplayHud;
             _receiveTouchInput = inputSettings ? settings.ReceiveTouchInput : true;
@@ -2529,11 +3098,12 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             NormalizeSettings();
             store.SaveSettings(new ReplaySettings
             {
-                SettingsVersion = 3,
+                SettingsVersion = 5,
                 SaveFullClear = _saveFullClear,
                 SaveEveryCompletion = _saveEveryCompletion,
                 SaveEveryFailure = _saveEveryFailure,
                 SaveFailureAt90Percent = _saveFailureAt90Percent,
+                DisableTutorialAutoSave = _disableTutorialAutoSave,
                 IgnoreAutoplay = _ignoreAutoplay,
                 ShowReplayHud = _showReplayHud,
                 ReceiveTouchInput = _receiveTouchInput,
@@ -2557,7 +3127,9 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
         GameApi? game = _game;
         bool editorPlay;
         lock (_stateLock)
+        {
             editorPlay = _editorPlayRequested;
+        }
         // Start_Rewind 被调用过说明游戏已确认要开始游玩，不管 state 是 0 还是 4 都应该录制。
         bool pendingStart;
         lock (_stateLock)
@@ -2571,7 +3143,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
         {
             if (_recording || _activeReplay != null || _pendingReplay != null || _currentAttempt != null)
                 return;
-            if (!_editorPlayRequested && _levelTransitionInProgress)
+            if (!editorPlay && _levelTransitionInProgress)
                 return;
             if (_editorFinalized)
                 return;
@@ -2618,6 +3190,8 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
         }
         BeginAttempt(controller, startTile, identity, editorPlay);
     }
+
+
 
     /// <summary>
     /// 解析本局录制真正的起始砖。
@@ -2678,7 +3252,15 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
     private static bool IsEditorReplay(ReplayData? replay)
     {
         return replay != null
-            && string.Equals(replay.SceneName, "scnEditor", StringComparison.OrdinalIgnoreCase);
+            && string.Equals(replay.SceneName, "scnEditor", StringComparison.OrdinalIgnoreCase)
+            && string.IsNullOrWhiteSpace(replay.LevelPath);
+    }
+
+    private static bool IsCustomReplayExitCandidate(ReplayData replay)
+    {
+        return !replay.IsOfficialLevel
+            && !IsEditorReplay(replay)
+            && !string.IsNullOrWhiteSpace(replay.LevelPath);
     }
 
     private static ReplayData? CloneReplay(ReplayData? source)

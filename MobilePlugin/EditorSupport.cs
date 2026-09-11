@@ -1,56 +1,33 @@
-using StArray.ModManager.Hooks;
 using StArray.ModManager.Manager;
 
 namespace Replay.Mobile;
 
-public static partial class EditorSupport
+public static class EditorSupport
 {
     private const string LogTag = "Replay";
-    private static ReplayPlugin? _plugin;
 
     internal static void Install(ReplayPlugin plugin)
     {
-        _plugin = plugin;
-        if (InstallHooks())
-        {
-            Logger.Info(LogTag, "Installed editor-mode hooks");
-            return;
-        }
-        UninstallHooks();
-        Logger.Info(LogTag, "Editor-mode hooks are unavailable (scnEditor class or methods missing)");
+        bool playInstalled = EditorPlayHook.Install(plugin);
+        bool resetInstalled = EditorResetHook.Install(plugin);
+        bool switchInstalled = EditorSwitchToEditModeHook.Install(plugin);
+        Logger.Info(
+            LogTag,
+            $"Editor hooks: Play={playInstalled}, ResetScene={resetInstalled}, "
+            + $"SwitchToEditMode={switchInstalled}");
     }
 
     internal static void Uninstall()
     {
-        UninstallHooks();
-        _plugin = null;
+        EditorPlayHook.Uninstall();
+        EditorResetHook.Uninstall();
+        EditorSwitchToEditModeHook.Uninstall();
     }
 
-    [UnmanagedHook("Assembly-CSharp.dll", "scnEditor", "Play", ParameterCount = 0)]
-    private static void EditorPlay(nint instance, nint methodInfo)
+    internal static void Detach()
     {
-        try
-        {
-            _plugin?.HandleEditorPlay(instance);
-        }
-        catch (Exception exception)
-        {
-            Logger.Error(LogTag, $"EditorPlay hook failed: {exception}");
-        }
-        EditorPlayOriginal(instance, methodInfo);
-    }
-
-    [UnmanagedHook("Assembly-CSharp.dll", "scnEditor", "ResetScene", ParameterCount = 1)]
-    private static void EditorResetScene(nint instance, byte param, nint methodInfo)
-    {
-        try
-        {
-            _plugin?.HandleEditorReset();
-        }
-        catch (Exception exception)
-        {
-            Logger.Error(LogTag, $"EditorResetScene hook failed: {exception}");
-        }
-        EditorResetSceneOriginal(instance, param, methodInfo);
+        EditorPlayHook.Detach();
+        EditorResetHook.Detach();
+        EditorSwitchToEditModeHook.Detach();
     }
 }

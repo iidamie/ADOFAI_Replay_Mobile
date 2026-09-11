@@ -27,7 +27,7 @@
 - 可配置回放目录、最大保存数量、自动保存与 HUD
 - 设置独立保存在 `mods/Replay/replay_settings.json`，不依赖 ModManager 的多态设置序列化
 - 新录制默认保存为 Deflate 压缩二进制 `.rpl2`，触摸轨道使用紧凑的差分编码以降低体积
-- 兼容读取已有手机版 JSON `.rpl` 和 PC 版 BinaryFormatter `.rpl`，旧文件标题编辑仍会保留 `.rpl` 路径
+- 兼容读取已有手机版 JSON `.rpl`，新文件保存为 `.rpl2`
 - 内置 GitHub 更新功能，支持在 Mod 设置中检查并下载最新 Replay Release，更新后重启游戏生效
 
 PC 自定义关卡回放通常保存的是电脑路径。把对应关卡放到手机后，先在游戏中打开同一关卡，再从 Replay 设置中播放该文件即可按歌曲名匹配当前关卡。
@@ -39,15 +39,14 @@ PC 自定义关卡回放通常保存的是电脑路径。把对应关卡放到�
 需要 .NET 10 SDK：
 
 1. 从新版 StArray.ModManager 获取 `StArray.ModManager.dll`、`StArray.ModManager.Android.dll`、`StArray.ModManager.Analyzer.dll` 和 `ImGui.NET.dll`。
-2. 从 .NET 10 SDK 获取 `System.Formats.Nrbf.dll`。
-3. 将五个引用文件放入 `References` 目录。
+2. 将四个引用文件放入 `References` 目录。
 
 ```bash
 dotnet build MobilePlugin/Replay.csproj -c Release
 python3 package_mod.py
 ```
 
-最终 Mod 只携带 `Replay.dll` 和用于安全读取旧 PC 回放的 `System.Formats.Nrbf.dll`。公共的 `StArray.ModManager.dll` 与 `ImGui.NET.dll` 由加载器提供。
+最终 Mod 携带 `Replay.dll` 和封面读取所需的 `SixLabors.ImageSharp.dll`。公共的 `StArray.ModManager.dll` 与 `ImGui.NET.dll` 由加载器提供。
 
 ## 自动构建
 
@@ -67,7 +66,7 @@ python3 package_mod.py
 mods/
 └── Replay/
     ├── Replay.dll
-    └── System.Formats.Nrbf.dll
+    └── SixLabors.ImageSharp.dll
 ```
 
 回放默认保存在 `mods/Replay/Replays`。新文件使用 `.rpl2` 扩展名；旧 `.rpl` 文件可以继续播放。此版本不使用 UnityModManager、Harmony 或 UnityEngine 托管程序集，也不需要 `Info.json`。
@@ -76,7 +75,7 @@ mods/
 
 Replay 启动后会检查 `iidamie/ADOFAI_Replay_Mobile` 的 GitHub Releases。发现新版本后，
 可在 Mod 设置页下载对应的 `Replay-版本.zip`。下载包会限制大小并验证 Replay 程序集，
-随后事务替换 `Replay.dll` 和 `System.Formats.Nrbf.dll`；`replay_settings.json`、`Replays`
+随后事务替换 `Replay.dll`；`replay_settings.json`、`Replays`
 目录以及其他用户文件不会被修改。更新完成后重启游戏即可生效。
 
 ## 下载

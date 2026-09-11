@@ -7,7 +7,7 @@ namespace Replay.Mobile;
 public static partial class GameHooks
 {
     private const string LogTag = "Replay";
-    private const int HookCount = 10;
+    private const int HookCount = 11;
     private const int FailOverloadHitMargin = 9;
 
     private static ReplayPlugin? _plugin;
@@ -100,6 +100,19 @@ public static partial class GameHooks
         }
     }
 
+    internal static bool TryInjectPlayerHit(
+        nint player,
+        bool autoHit,
+        int hitMargin,
+        out byte result)
+    {
+        result = 0;
+        if (_plugin == null || _playerHitMethodInfo == 0)
+            return false;
+        result = InjectPlayerHit(player, autoHit, hitMargin);
+        return true;
+    }
+
     internal static int CalculateHitMargin(
         float angle,
         float targetAngle,
@@ -116,6 +129,28 @@ public static partial class GameHooks
             pitch,
             marginScale,
             _getHitMarginMethodInfo);
+    }
+
+    internal static bool TryCalculateHitMargin(
+        float angle,
+        float targetAngle,
+        bool clockwise,
+        float bpm,
+        float pitch,
+        double marginScale,
+        out int result)
+    {
+        result = 3;
+        if (_plugin == null || _getHitMarginMethodInfo == 0)
+            return false;
+        result = CalculateHitMargin(
+            angle,
+            targetAngle,
+            clockwise,
+            bpm,
+            pitch,
+            marginScale);
+        return (uint)result <= 11u;
     }
 
     /// <summary>
@@ -284,6 +319,33 @@ public static partial class GameHooks
         }
     }
 
+    [UnmanagedHook("Assembly-CSharp.dll", "scrController", "QuitToMainMenu", ParameterCount = 0)]
+    private static void QuitToMainMenu(nint instance, nint methodInfo)
+    {
+        try
+        {
+            // A user exit from a custom Replay must clear GCS.customLevelPaths
+            // before the native API runs; otherwise the game intentionally
+            // routes back to scnCLS instead of the normal main page. This is
+            // only armed for local custom replays and is never triggered by
+            // replay completion itself.
+            _plugin?.HandleCustomReplayQuit(instance);
+        }
+        catch (Exception exception)
+        {
+            Logger.Error(LogTag, $"Custom replay QuitToMainMenu handling failed: {exception}");
+        }
+
+        try
+        {
+            QuitToMainMenuOriginal(instance, methodInfo);
+        }
+        catch (Exception exception)
+        {
+            Logger.Error(LogTag, $"QuitToMainMenu trampoline failed: {exception}");
+        }
+    }
+
     [UnmanagedHook("Assembly-CSharp.dll", "scrController", "Update", ParameterCount = 0)]
     private static void ControllerUpdate(nint instance, nint methodInfo)
     {
@@ -296,6 +358,7 @@ public static partial class GameHooks
         {
             Logger.Error(LogTag, $"Controller update failed: {exception}");
         }
+
     }
 
     [UnmanagedHook("Assembly-CSharp.dll", "scrConductor", "Update", ParameterCount = 0)]

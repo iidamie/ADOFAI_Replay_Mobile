@@ -9,6 +9,7 @@ namespace Replay.Mobile;
 internal sealed class GameApi
 {
     private const string CustomLevelSelectScene = "scnCLS";
+    private const string GameScene = "scnGame";
     private const int CustomLevelsScenePortal = 5;
     private const int LocalCustomLevelCategory = 1;
 
@@ -42,6 +43,8 @@ internal sealed class GameApi
     private readonly IRuntimeField? _controllerLevelName;
     private readonly IRuntimeField? _controllerMultipressPenalty;
     private readonly IRuntimeField? _controllerMultipressFirst;
+    private readonly IRuntimeField? _editorInstance;
+    private readonly IRuntimeField? _editorPlayMode;
 
     private readonly IRuntimeField? _playerPlanetarySystem;
     private readonly IRuntimeField? _playerMidspinInfinite;
@@ -85,6 +88,8 @@ internal sealed class GameApi
     private readonly IRuntimeField? _customLevelSelectRefreshing;
     private readonly IRuntimeField? _customLevelSelectLevelToSelect;
     private readonly IRuntimeField? _customLevelSelectLoadedLevels;
+    private readonly IRuntimeField? _editorCustomLevel;
+    private readonly IRuntimeField? _editorLevelToOpenOnLoad;
 
     private readonly IRuntimeField? _checkpoint;
     private readonly IRuntimeField? _sceneToLoad;
@@ -93,11 +98,13 @@ internal sealed class GameApi
     private readonly IRuntimeField? _loadCustomFromBundle;
     private readonly IRuntimeField? _customLevelIndex;
     private readonly IRuntimeField? _customLevelId;
+    private readonly IRuntimeField? _speedTrialMode;
     private readonly IRuntimeField? _currentSpeedTrial;
     private readonly IRuntimeField? _nextSpeedRun;
     private readonly IRuntimeField? _lofiVersion;
     private readonly IRuntimeField? _language;
     private readonly IRuntimeField? _textValue;
+    private readonly nint _gcsTypeObject;
 
     private readonly IRuntimeMethod? _getController;
     private readonly IRuntimeMethod? _getEditor;
@@ -118,6 +125,11 @@ internal sealed class GameApi
     private readonly IRuntimeMethod? _getPlayerAuto;
     private readonly IRuntimeMethod? _getLevelArtist;
     private readonly IRuntimeMethod? _getLevelSong;
+    private readonly IRuntimeMethod? _getLevelPath;
+    private readonly IRuntimeMethod? _loadCustomLevel;
+    private readonly IRuntimeMethod? _gamePlay;
+    private readonly IRuntimeMethod? _gameResetScene;
+    private readonly IRuntimeMethod? _getLevelSelectInstance;
     private readonly EditorDeselectFloorsDelegate? _editorDeselectFloors;
     private readonly nint _editorDeselectFloorsMethodInfo;
     private readonly EditorVoidDelegate? _editorDeselectDecorations;
@@ -180,9 +192,15 @@ internal sealed class GameApi
     /// 回到开始岛后才能安全调用 <c>scrController.EnterLevel</c>。
     /// </summary>
     internal bool WaitingForLevelSelect { get; private set; }
-    internal bool CanLoadScenes => _portalTravelAction != null
-        && _getCustomLevelSelect != null
-        && _customLevelSelectEnterLevel != null;
+    internal bool CanLoadScenes => _loadCustomLevel != null
+        || _portalTravelAction != null
+            && _getCustomLevelSelect != null
+            && _customLevelSelectEnterLevel != null;
+    internal IAppDomain RuntimeDomain => _domain;
+    internal IRuntimeAssembly GameAssembly => _gameAssembly;
+    internal bool CanRestartReplayAt => _gameInstance != null
+        && _gamePlay != null
+        && _gameResetScene != null;
     internal bool CanCreateIslandFloor => CanCreateIslandEntry();
     internal string LastIslandEntryError { get; private set; } = "";
 
@@ -218,6 +236,8 @@ internal sealed class GameApi
         _controllerLevelName = FindField(_controllerClass, "levelName", "originalLevelName");
         _controllerMultipressPenalty = FindField(_controllerClass, "multipressPenalty");
         _controllerMultipressFirst = FindField(_controllerClass, "multipressAndHasPressedFirstPress");
+        _editorInstance = FindField(_editorClass, "_instance", "instance");
+        _editorPlayMode = FindField(_editorClass, "playMode", "_playMode");
 
         _playerPlanetarySystem = FindField(_playerClass, "planetarySystem");
         _playerMidspinInfinite = FindField(_playerClass, "midspinInfiniteMargin");
@@ -261,6 +281,9 @@ internal sealed class GameApi
         _customLevelSelectRefreshing = FindField(_customLevelSelectClass, "refreshing");
         _customLevelSelectLevelToSelect = FindField(_customLevelSelectClass, "levelToSelect");
         _customLevelSelectLoadedLevels = FindField(_customLevelSelectClass, "loadedLevels");
+        _editorCustomLevel = FindField(_editorClass, "customLevel");
+        _editorLevelToOpenOnLoad = FindField(_editorClass, "levelToOpenOnLoad");
+        _gcsTypeObject = _gcsClass is Il2CppClass gcsClass ? gcsClass.GetTypeObject() : 0;
 
         _checkpoint = FindField(_gcsClass, "_checkpointNum", "checkpointNum");
         _sceneToLoad = FindField(_gcsClass, "sceneToLoad");
@@ -269,6 +292,7 @@ internal sealed class GameApi
         _loadCustomFromBundle = FindField(_gcsClass, "loadCustomFromBundle");
         _customLevelIndex = FindField(_gcsClass, "customLevelIndex");
         _customLevelId = FindField(_gcsClass, "customLevelId");
+        _speedTrialMode = FindField(_gcsClass, "speedTrialMode");
         _currentSpeedTrial = FindField(_gcsClass, "currentSpeedTrial");
         _nextSpeedRun = FindField(_gcsClass, "nextSpeedRun");
         _lofiVersion = FindField(_gcsClass, "lofiVersion");
@@ -295,6 +319,17 @@ internal sealed class GameApi
         _getPlayerAuto = _playerClass.GetMethod("get_auto", 0);
         _getLevelArtist = _levelDataClass?.GetMethod("get_artist", 0);
         _getLevelSong = _levelDataClass?.GetMethod("get_song", 0);
+        _getLevelPath = _adoBaseClass?.GetMethod("get_levelPath", 0);
+        _loadCustomLevel = _controllerClass.GetMethod("LoadCustomLevel", 3);
+        _gamePlay = _gameClass?.GetMethod(
+                "Play",
+                new[] { "System.Int32", "System.Boolean" })
+            ?? _gameClass?.GetMethod("Play", 2);
+        _gameResetScene = _gameClass?.GetMethod(
+                "ResetScene",
+                new[] { "System.Boolean" })
+            ?? _gameClass?.GetMethod("ResetScene", 1);
+        _getLevelSelectInstance = _levelSelectClass?.GetMethod("get_instance", 0);
 
         _editorDeselectFloors = Bind<EditorDeselectFloorsDelegate>(
             _editorClass, "DeselectFloors", new[] { "System.Boolean" },
@@ -417,7 +452,8 @@ internal sealed class GameApi
 
     internal nint GetEditor()
     {
-        return InvokeStaticObject(_getEditor);
+        nint editor = InvokeStaticObject(_getEditor);
+        return editor != 0 ? editor : Read(_editorInstance, 0, nint.Zero);
     }
 
     internal bool IsEditorScene()
@@ -432,15 +468,26 @@ internal sealed class GameApi
     internal bool IsEditorPlayMode()
     {
         nint editor = GetEditor();
-        if (editor == 0 || _getEditorPlayMode == null)
+        if (editor == 0)
             return false;
+        bool playMode = false;
+        if (_getEditorPlayMode != null)
+        {
+            try
+            {
+                playMode = _getEditorPlayMode.InvokeUnbox<byte>(editor) != 0;
+            }
+            catch
+            {
+            }
+        }
         try
         {
-            return _getEditorPlayMode.InvokeUnbox<byte>(editor) != 0;
+            return playMode || Read(_editorPlayMode, editor, (byte)0) != 0;
         }
         catch
         {
-            return false;
+            return playMode;
         }
     }
 
@@ -549,18 +596,32 @@ internal sealed class GameApi
 
     internal bool IsLevelSelect()
     {
-        string sceneName = InvokeStaticString(_getSceneName);
-        if (!string.IsNullOrWhiteSpace(sceneName))
-        {
-            // GCNS.sceneLevelSelect 在手机菜单模式下是 scnMobileMenu，其余情况是 scnLevelSelect。
-            // 两者都是可以安全调用 scrController.EnterLevel 的开始岛场景。
-            return string.Equals(sceneName, "scnLevelSelect", StringComparison.OrdinalIgnoreCase)
-                || string.Equals(sceneName, "scnLevelSelectBase", StringComparison.OrdinalIgnoreCase)
-                || string.Equals(sceneName, "scnMobileMenu", StringComparison.OrdinalIgnoreCase);
-        }
         nint controller = GetController();
+        string sceneName = InvokeStaticString(_getSceneName);
+        if (string.IsNullOrWhiteSpace(sceneName))
+            sceneName = ReadString(_sceneToLoad, 0);
+
+        // 3.1.2 的主页可能使用不同的场景名；这些场景都属于可以安全
+        // 调用 scrController.EnterLevel 的开始岛场景。
+        if (string.Equals(sceneName, "scnLevelSelect", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(sceneName, "scnLevelSelectBase", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(sceneName, "scnMobileMenu", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(sceneName, "scnLevelSelectTaro", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        // Some 3.1.2 menu transitions keep the old controller's gameworld
+        // flag for a short time and expose an empty sceneName. The level
+        // select singleton is the same authoritative object used by the
+        // game's own ADOBase.levelSelect property, so use it before the
+        // stale controller flag can hide the main-page entry.
+        if (InvokeStaticObject(_getLevelSelectInstance) != 0)
+            return true;
+
         if (IsGameWorld(controller))
             return false;
+
         try
         {
             if (_getIsLevelSelect?.InvokeStaticUnbox<byte>() != 0)
@@ -574,8 +635,11 @@ internal sealed class GameApi
 
     internal bool IsCustomLevelSelect()
     {
+        string sceneName = InvokeStaticString(_getSceneName);
+        if (string.IsNullOrWhiteSpace(sceneName))
+            sceneName = ReadString(_sceneToLoad, 0);
         return string.Equals(
-            InvokeStaticString(_getSceneName),
+            sceneName,
             CustomLevelSelectScene,
             StringComparison.OrdinalIgnoreCase);
     }
@@ -776,12 +840,18 @@ internal sealed class GameApi
                     reason = "editor song name is not ready";
                     return false;
                 }
+                string editorLevelPath = GetLevelPath();
+                if (!File.Exists(editorLevelPath))
+                    editorLevelPath = "";
+                string editorLevelId = GetCustomLevelKey(editorLevelPath);
+                if (string.IsNullOrWhiteSpace(editorLevelId))
+                    editorLevelId = $"editor:{songName}:{totalTiles}";
                 identity = new ReplayLevelIdentity(
                     songName,
                     GetArtistName(),
-                    "",
+                    editorLevelPath,
                     GetSceneName(),
-                    $"editor:{songName}:{totalTiles}",
+                    editorLevelId,
                     false,
                     totalTiles);
                 return true;
@@ -793,7 +863,11 @@ internal sealed class GameApi
         {
             // 编辑器模式下谱面可能在内存中，没有磁盘文件路径。
             if (skipGameWorldCheck)
-                levelPath = "";
+            {
+                levelPath = GetLevelPath();
+                if (!File.Exists(levelPath))
+                    levelPath = "";
+            }
             else
             {
                 reason = "custom level path is not ready";
@@ -959,6 +1033,20 @@ internal sealed class GameApi
         Write(_checkpoint, 0, Math.Max(0, tile));
     }
 
+    /// <summary>
+    /// Applies the same speed globals used by ReplayBasePatches.Start before
+    /// restarting a replay from a nearby tile. Native scnGame reads these
+    /// values while rebuilding the conductor, which keeps the audio and tile
+    /// timeline aligned after a speed change.
+    /// </summary>
+    internal void SetReplayPlaybackSpeed(float speed)
+    {
+        speed = float.IsFinite(speed) ? Math.Clamp(speed, 0.1f, 10f) : 1f;
+        Write(_speedTrialMode, 0, (byte)0);
+        Write(_currentSpeedTrial, 0, speed);
+        Write(_nextSpeedRun, 0, speed);
+    }
+
     internal float GetBpm()
     {
         return Read(_conductorBpm, GetConductor(), 0f);
@@ -1016,7 +1104,25 @@ internal sealed class GameApi
     internal string GetLevelPath()
     {
         nint game = Read(_gameInstance, 0, nint.Zero);
-        return ReadString(_gameLevelPath, game);
+        string path = ReadString(_gameLevelPath, game);
+        if (!string.IsNullOrWhiteSpace(path))
+            return path;
+
+        // In editor play mode scnGame.instance is commonly null, but the
+        // editor keeps the backing scnGame in its customLevel field.
+        nint editor = GetEditor();
+        nint editorCustomLevel = Read(_editorCustomLevel, editor, nint.Zero);
+        path = ReadString(_gameLevelPath, editorCustomLevel);
+        if (!string.IsNullOrWhiteSpace(path))
+            return path;
+
+        path = InvokeStaticString(_getLevelPath);
+        if (!string.IsNullOrWhiteSpace(path))
+            return path;
+
+        // This is normally only populated during an editor scene transition,
+        // but it is a useful final fallback for a just-opened custom chart.
+        return ReadString(_editorLevelToOpenOnLoad, 0);
     }
 
     internal string GetSceneName()
@@ -1056,6 +1162,10 @@ internal sealed class GameApi
                 LastLoadRoute = "Restart";
                 return Restart(controller) || FailLoad("无法重新加载当前谱面。");
             }
+            if (IsGameWorld(controller))
+                return FailLoad("当前已经在其他游戏场景中，请先返回开始岛后再打开回放。");
+            if (Read(_controllerTransitioningLevel, controller, (byte)0) != 0)
+                return FailLoad("游戏正在进行其他谱面转场，请稍后再试。");
 
             if (replay.IsOfficialLevel)
             {
@@ -1095,18 +1205,57 @@ internal sealed class GameApi
                     || FailLoad("官方关卡加载接口没有设置目标场景。");
             }
 
-            // 编辑器回放：没有磁盘文件，也不主动调用 Play。
-            // 只设置 GCS.checkpointNum 等回放元数据，等用户自己按 Play 后走 Start_Rewind 激活。
-            if (replay.SceneName == "scnEditor" && string.IsNullOrWhiteSpace(replay.LevelPath))
+            if (string.IsNullOrWhiteSpace(replay.LevelPath))
             {
+                return replay.SceneName == "scnEditor"
+                    ? FailLoad("编辑器回放没有记录可重新打开的谱面路径，请重新录制该回放。")
+                    : FailLoad("找不到回放对应的自定义谱面文件。");
+            }
+
+            string fullPath;
+            try
+            {
+                fullPath = Path.GetFullPath(replay.LevelPath);
+            }
+            catch (Exception exception)
+            {
+                return FailLoad($"无法解析回放谱面路径: {exception.Message}");
+            }
+            if (!File.Exists(fullPath))
+                return FailLoad("找不到回放对应的自定义谱面文件。");
+            if (!CustomLevelMatchesReplay(fullPath, replay.SongName, out string actualSong))
+                return FailLoad($"回放歌曲“{replay.SongName}”与目标谱面“{actualSong}”不匹配，已阻止加载以避免崩溃。");
+
+            replay.LevelPath = fullPath;
+            if (_loadCustomLevel != null)
+            {
+                if (!ClearInternalLevelName("打开 Replay 自定义谱面前"))
+                    return FailLoad("无法清理旧的官方关卡标识，已阻止打开 Replay 自定义谱面。");
+
                 ApplyReplayGlobals(replay);
-                LastLoadRoute = "PendingEditorPlay";
+                Write(_customLevelIndex, 0, 0);
+                if (!InvokeLoadCustomLevel(controller, fullPath, out nint loadException))
+                    return FailLoad($"原生直接加载 Replay 自定义谱面失败: 0x{loadException:X}");
+
+                nint customPaths = Read(_customLevelPaths, 0, nint.Zero);
+                int customPathCount = GetArrayLength(customPaths);
+                if (!string.Equals(ReadString(_sceneToLoad, 0), GameScene, StringComparison.Ordinal)
+                    || customPaths == 0
+                    || customPathCount == 0)
+                {
+                    return FailLoad("原生 Replay 自定义谱面入口没有建立有效的加载请求。");
+                }
+
+                WaitingForCustomLevelBrowser = false;
+                WaitingForLevelSelect = false;
+                _customCategoryRequested = false;
+                LastLoadRoute = "scrController.LoadCustomLevel";
+                Logger.Info(
+                    "Replay",
+                    $"通过原生直接入口打开自定义谱面: path='{fullPath}', count={customPathCount}");
                 return true;
             }
-            if (string.IsNullOrWhiteSpace(replay.LevelPath) || !File.Exists(replay.LevelPath))
-                return FailLoad("找不到回放对应的自定义谱面文件。");
-            if (!CustomLevelMatchesReplay(replay.LevelPath, replay.SongName, out string actualSong))
-                return FailLoad($"回放歌曲“{replay.SongName}”与目标谱面“{actualSong}”不匹配，已阻止加载以避免崩溃。");
+
             string levelKey = GetReplayCustomLevelKey(replay);
             if (string.IsNullOrWhiteSpace(levelKey))
                 return FailLoad("无法确定自定义关卡在游戏列表中的条目标识。");
@@ -1137,6 +1286,35 @@ internal sealed class GameApi
         {
             CancelPendingCustomReplayLoad();
             return FailLoad(exception.Message);
+        }
+    }
+
+    private bool InvokeLoadCustomLevel(nint controller, string levelPath, out nint exception)
+    {
+        exception = 0;
+        if (_loadCustomLevel == null)
+        {
+            exception = 1;
+            return false;
+        }
+
+        RuntimeString runtimeLevelPath = RuntimeString.New(_domain, levelPath);
+        if (!runtimeLevelPath.IsValid)
+        {
+            exception = 1;
+            return false;
+        }
+
+        byte fromBundle = 0;
+        unsafe
+        {
+            nint[] arguments =
+            {
+                runtimeLevelPath.Ptr,
+                nint.Zero,
+                (nint)(&fromBundle),
+            };
+            return InvokeRuntimeMethod(_loadCustomLevel, controller, arguments, out exception);
         }
     }
 
@@ -1334,6 +1512,64 @@ internal sealed class GameApi
         return true;
     }
 
+    internal bool RestartCurrentLevel(nint controller)
+        => controller != 0 && Restart(controller);
+
+    /// <summary>
+    /// Rebuilds the current custom game scene from a replay brick. This is the
+    /// same path used by Replay Mobile's original speed-change implementation:
+    /// scnGame.ResetScene(false) followed by scnGame.Play(sequence, true).
+    /// scrController.Restart only reloads the scene and leaves the existing
+    /// custom track state alive on some mobile builds, which makes a replay
+    /// inject old events into a track that is still at the previous position.
+    /// </summary>
+    internal unsafe bool RestartReplayAt(nint controller, int sequence)
+    {
+        if (controller == 0)
+            return false;
+
+        sequence = Math.Max(0, sequence);
+        SetCheckpoint(sequence);
+        nint game = Read(_gameInstance, 0, nint.Zero);
+        if (game == 0 || _gameResetScene == null || _gamePlay == null)
+            return false;
+
+        try
+        {
+            // Buffer protection may have paused the native controller just
+            // before the user changes speed. On 3.1.2 the pause guard blocks
+            // Clear the pause through the setter before ResetScene inspects
+            // that state.
+            SetPaused(controller, false);
+
+            // Match WatchReplay.ResetCustomLevel exactly. ResetScene's
+            // optional argument defaults to false; Play's isRestart argument
+            // defaults to true in the game assembly.
+            byte resetCustomLevel = 0;
+            _gameResetScene.Invoke(game, new[] { (nint)(&resetCustomLevel) });
+
+            byte isRestart = 1;
+            byte started = _gamePlay.InvokeUnbox<byte>(game, new[]
+            {
+                (nint)(&sequence),
+                (nint)(&isRestart),
+            });
+            // scnGame.Play can leave the controller transition flag set after
+            // a synchronous replay reset. The original Replay path clears it
+            // immediately after Play so the next Start_Rewind is accepted.
+            Write(_controllerTransitioningLevel, controller, (byte)0);
+            Logger.Info(
+                "Replay",
+                $"已按 Replay 原生路径重建当前轨道: sequence={sequence}, started={started != 0}");
+            return started != 0;
+        }
+        catch (Exception exception)
+        {
+            Logger.Warn("Replay", $"按 Replay 原生路径重建轨道失败: {exception.Message}");
+            return false;
+        }
+    }
+
     private void ApplyReplayGlobals(ReplayData replay)
     {
         float speed = replay.Speed > 0f ? replay.Speed : 1f;
@@ -1350,6 +1586,37 @@ internal sealed class GameApi
         Write(_customLevelId, 0, nint.Zero);
         Write(_loadCustomFromBundle, 0, (byte)0);
         Write(_customLevelIndex, 0, 0);
+    }
+
+    /// <summary>
+    /// Clears only the custom-level state that makes the native
+    /// QuitToMainMenu path return to scnCLS. The destination scene itself is
+    /// left intact so the original game API can select the normal main page.
+    /// </summary>
+    internal void ReleaseCustomLevelState()
+    {
+        nint before = Read(_customLevelPaths, 0, nint.Zero);
+        bool directWrite = false;
+        if (_customLevelPaths != null && _customLevelPaths.IsStatic)
+        {
+            Write(_customLevelPaths, 0, nint.Zero);
+            directWrite = Read(_customLevelPaths, 0, nint.Zero) == 0;
+        }
+
+        bool reflectionWrite = false;
+        if (!directWrite)
+            reflectionWrite = SetStaticReferenceWithManagedReflection("customLevelPaths", nint.Zero);
+
+        Write(_customLevelIndex, 0, 0);
+        Write(_loadCustomFromBundle, 0, (byte)0);
+        Write(_customLevelId, 0, nint.Zero);
+        ClearInternalLevelName("退出 Replay 自定义谱面前");
+
+        nint after = Read(_customLevelPaths, 0, nint.Zero);
+        Logger.Info(
+            "Replay",
+            $"退出 Replay 自定义谱面前清理 customLevelPaths: before=0x{before:X}, "
+            + $"direct={directWrite}, reflection={reflectionWrite}, cleared={after == 0}");
     }
 
     private bool CanCreateIslandEntry()
@@ -1458,6 +1725,61 @@ internal sealed class GameApi
         return false;
     }
 
+    private bool ClearInternalLevelName(string stage)
+    {
+        if (_internalLevelName == null)
+            return false;
+
+        bool directWrite = false;
+        try
+        {
+            Write(_internalLevelName, 0, nint.Zero);
+            directWrite = Read(_internalLevelName, 0, nint.Zero) == 0;
+        }
+        catch
+        {
+        }
+
+        bool reflectionWrite = false;
+        if (!directWrite)
+            reflectionWrite = SetStaticReferenceWithManagedReflection("internalLevelName", nint.Zero);
+
+        nint value = Read(_internalLevelName, 0, nint.Zero);
+        Logger.Info(
+            "Replay",
+            $"{stage}清理 internalLevelName: direct={directWrite}, "
+            + $"reflection={reflectionWrite}, value=0x{value:X}");
+        return value == 0;
+    }
+
+    private bool SetStaticReferenceWithManagedReflection(string fieldName, nint value)
+    {
+        if (_gcsTypeObject == 0)
+            return false;
+        try
+        {
+            RuntimeString runtimeFieldName = RuntimeString.New(_domain, fieldName);
+            if (!runtimeFieldName.IsValid)
+                return false;
+            nint fieldInfo = new RuntimeObject(_gcsTypeObject).Invoke(
+                "GetField",
+                1,
+                new[] { runtimeFieldName.Ptr });
+            if (fieldInfo == 0)
+                return false;
+            new RuntimeObject(fieldInfo).InvokeVoid(
+                "SetValue",
+                2,
+                new[] { nint.Zero, value });
+            return true;
+        }
+        catch (Exception exception)
+        {
+            Logger.Debug("Replay", $"托管反射清理 {fieldName} 失败: {exception.Message}");
+            return false;
+        }
+    }
+
     private bool HasTargetScene(bool customLevel)
     {
         return !string.IsNullOrWhiteSpace(ReadString(_sceneToLoad, 0));
@@ -1488,6 +1810,8 @@ internal sealed class GameApi
 
     private static string GetCustomLevelKey(string levelPath)
     {
+        if (string.IsNullOrWhiteSpace(levelPath))
+            return "";
         try
         {
             string? directory = Path.GetDirectoryName(Path.GetFullPath(levelPath));

@@ -31,7 +31,10 @@ def main() -> int:
         print("Build MobilePlugin/Replay.csproj first, or pass its output directory.", file=sys.stderr)
         return 1
 
-    required_files = [f"{MOD_ID}.dll", "System.Formats.Nrbf.dll"]
+    required_files = [
+        f"{MOD_ID}.dll",
+        "SixLabors.ImageSharp.dll",
+    ]
     missing = [name for name in required_files if not output.joinpath(name).is_file()]
     if missing:
         print(f"Missing build files: {', '.join(missing)}", file=sys.stderr)

@@ -25,7 +25,7 @@ internal sealed class GitHubUpdateService : IDisposable
     private static readonly string[] RequiredFiles =
     {
         "Replay.dll",
-        "System.Formats.Nrbf.dll",
+        "SixLabors.ImageSharp.dll",
     };
 
     private readonly string _modDirectory;
@@ -327,6 +327,12 @@ internal sealed class GitHubUpdateService : IDisposable
 
     private static ReleaseInfo? TryParseMobileRelease(JsonElement root)
     {
+        if (root.TryGetProperty("draft", out JsonElement draft)
+            && draft.ValueKind == JsonValueKind.True)
+            return null;
+        if (root.TryGetProperty("prerelease", out JsonElement prerelease)
+            && prerelease.ValueKind == JsonValueKind.True)
+            return null;
         if (!root.TryGetProperty("tag_name", out JsonElement tagElement))
             return null;
         string tag = tagElement.GetString() ?? "";
@@ -334,6 +340,8 @@ internal sealed class GitHubUpdateService : IDisposable
             return null;
 
         string version = NormalizeVersionText(tag);
+        if (!TryParseSemanticVersion(version, out _, out _))
+            return null;
         string expectedName = $"{PackagePrefix}{version}.zip";
         Uri? packageUri = null;
         int packagePriority = int.MaxValue;
@@ -497,46 +505,124 @@ internal sealed class GitHubUpdateService : IDisposable
 
     private static int CompareVersions(string left, string right)
     {
-        int[] leftParts = ExtractNumericParts(left);
-        int[] rightParts = ExtractNumericParts(right);
-        int count = Math.Max(leftParts.Length, rightParts.Length);
-        for (int index = 0; index < count; index++)
+        if (!TryParseSemanticVersion(left, out string[] leftCore, out string[] leftPre)
+            || !TryParseSemanticVersion(right, out string[] rightCore, out string[] rightPre))
         {
-            int leftPart = index < leftParts.Length ? leftParts[index] : 0;
-            int rightPart = index < rightParts.Length ? rightParts[index] : 0;
-            if (leftPart != rightPart)
-                return leftPart.CompareTo(rightPart);
+            return string.Compare(
+                NormalizeVersionText(left),
+                NormalizeVersionText(right),
+                StringComparison.OrdinalIgnoreCase);
         }
-        return string.Compare(
-            NormalizeVersionText(left),
-            NormalizeVersionText(right),
-            StringComparison.OrdinalIgnoreCase);
+
+        int coreCount = Math.Max(leftCore.Length, rightCore.Length);
+        for (int index = 0; index < coreCount; index++)
+        {
+            string leftPart = index < leftCore.Length ? leftCore[index] : "0";
+            string rightPart = index < rightCore.Length ? rightCore[index] : "0";
+            int coreComparison = CompareNumericIdentifiers(leftPart, rightPart);
+            if (coreComparison != 0)
+                return coreComparison;
+        }
+
+        bool leftHasPre = leftPre.Length > 0;
+        bool rightHasPre = rightPre.Length > 0;
+        if (leftHasPre != rightHasPre)
+            return leftHasPre ? -1 : 1;
+        if (!leftHasPre)
+            return 0;
+
+        int preCount = Math.Max(leftPre.Length, rightPre.Length);
+        for (int index = 0; index < preCount; index++)
+        {
+            if (index >= leftPre.Length)
+                return -1;
+            if (index >= rightPre.Length)
+                return 1;
+
+            string leftIdentifier = leftPre[index];
+            string rightIdentifier = rightPre[index];
+            bool leftNumeric = IsNumericIdentifier(leftIdentifier);
+            bool rightNumeric = IsNumericIdentifier(rightIdentifier);
+            if (leftNumeric && rightNumeric)
+            {
+                int numericComparison = CompareNumericIdentifiers(leftIdentifier, rightIdentifier);
+                if (numericComparison != 0)
+                    return numericComparison;
+            }
+            else if (leftNumeric != rightNumeric)
+            {
+                return leftNumeric ? -1 : 1;
+            }
+            else
+            {
+                int textComparison = string.CompareOrdinal(leftIdentifier, rightIdentifier);
+                if (textComparison != 0)
+                    return textComparison;
+            }
+        }
+        return 0;
     }
 
-    private static int[] ExtractNumericParts(string value)
+    private static bool TryParseSemanticVersion(
+        string value,
+        out string[] coreParts,
+        out string[] prereleaseParts)
     {
-        List<int> parts = new();
-        int current = 0;
-        bool reading = false;
-        foreach (char character in value)
-        {
-            if (character is >= '0' and <= '9')
-            {
-                reading = true;
-                current = Math.Min(999999, current * 10 + character - '0');
-                continue;
-            }
+        coreParts = Array.Empty<string>();
+        prereleaseParts = Array.Empty<string>();
+        string normalized = NormalizeVersionText(value);
+        int buildSeparator = normalized.IndexOf('+');
+        if (buildSeparator >= 0)
+            normalized = normalized[..buildSeparator];
 
-            if (reading)
-            {
-                parts.Add(current);
-                current = 0;
-                reading = false;
-            }
+        int prereleaseSeparator = normalized.IndexOf('-');
+        string core = prereleaseSeparator >= 0
+            ? normalized[..prereleaseSeparator]
+            : normalized;
+        string prerelease = prereleaseSeparator >= 0
+            ? normalized[(prereleaseSeparator + 1)..]
+            : "";
+        if (string.IsNullOrEmpty(core))
+            return false;
+
+        coreParts = core.Split('.');
+        if (coreParts.Any(part => string.IsNullOrEmpty(part) || !IsNumericIdentifier(part)))
+        {
+            coreParts = Array.Empty<string>();
+            return false;
         }
-        if (reading)
-            parts.Add(current);
-        return parts.ToArray();
+
+        if (prerelease.Length == 0)
+            return true;
+        prereleaseParts = prerelease.Split('.');
+        if (prereleaseParts.Any(part => string.IsNullOrEmpty(part)
+                || part.Any(character => character is not (>= '0' and <= '9')
+                    && character is not (>= 'A' and <= 'Z')
+                    && character is not (>= 'a' and <= 'z')
+                    && character != '-')))
+        {
+            coreParts = Array.Empty<string>();
+            prereleaseParts = Array.Empty<string>();
+            return false;
+        }
+        return true;
+    }
+
+    private static bool IsNumericIdentifier(string value)
+        => value.Length > 0 && value.All(character => character is >= '0' and <= '9');
+
+    private static int CompareNumericIdentifiers(string left, string right)
+    {
+        left = left.TrimStart('0');
+        right = right.TrimStart('0');
+        if (left.Length == 0)
+            left = "0";
+        if (right.Length == 0)
+            right = "0";
+        int lengthComparison = left.Length.CompareTo(right.Length);
+        return lengthComparison != 0
+            ? lengthComparison
+            : string.CompareOrdinal(left, right);
     }
 
     private static string NormalizeVersionText(string value)
