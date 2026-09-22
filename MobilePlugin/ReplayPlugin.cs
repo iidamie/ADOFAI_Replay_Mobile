@@ -10,7 +10,7 @@ using StArray.ModManager.Runtime;
 
 namespace Replay.Mobile;
 
-public sealed class ReplayPlugin : IModPlugin, IModSettings
+public sealed partial class ReplayPlugin : IModPlugin, IModSettings
 {
     private const string LogTag = "Replay";
     private const int PlayerControlState = 4;
@@ -54,6 +54,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
     private string _selectedReplayPath = "";
     private string _editingReplayPath = "";
     private string _replayTitleEdit = "";
+    private bool _managerTitleEditing;
     private string _managerPreviewKey = "";
     private string _fileSearch = "";
     private string _pendingDeletePath = "";
@@ -68,10 +69,14 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
     private bool _touchInputSubscribed;
     private bool _keyboardInputActive;
     private bool _managerOpen;
+    private int _managerSection;
+    private bool _replayControlsExpanded = true;
+    private bool _replayDifficultySelectorShown;
     private bool _managerShowingDetails;
     private bool _managerPausedGame;
     private bool _resultAttemptSaved;
     private bool _resultSaveQueued;
+    private DateTime _resultSaveButtonUntilUtc;
     private bool _deletePopupRequested;
     private bool _islandEntryLogged;
     private long _lastSettingsGuiTick;
@@ -265,6 +270,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             _managerPausedGame = false;
             _resultAttemptSaved = false;
             _resultSaveQueued = false;
+            _resultSaveButtonUntilUtc = default;
             _autoSavedSessions.Clear();
             _runState = ReplayRunState.Idle;
             _loadStage = ReplayLoadStage.None;
@@ -342,12 +348,14 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             _loadDeadlineUtc = default;
             _resultAttemptSaved = false;
             _resultSaveQueued = false;
+            _resultSaveButtonUntilUtc = default;
             _replayTouchIndex = 0;
             _replayKeyboardIndex = 0;
             _recordingStartTicks = 0;
             _replayClockStartTicks = 0;
             _replayPausedTicks = 0;
             _replayPauseStartTicks = 0;
+            _replayDifficultySelectorShown = false;
             _toast = "";
             _toastUntilUtc = default;
         }
@@ -460,6 +468,19 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
 
     public void OnGui()
     {
+        ImGui.PushStyleColor(ImGuiCol.Header, new Vector4(0.10f, 0.22f, 0.22f, 1f));
+        ImGui.PushStyleColor(ImGuiCol.HeaderHovered, new Vector4(0.14f, 0.32f, 0.31f, 1f));
+        ImGui.PushStyleColor(ImGuiCol.FrameBg, new Vector4(0.08f, 0.14f, 0.15f, 1f));
+        ImGui.PushStyleColor(ImGuiCol.FrameBgHovered, new Vector4(0.12f, 0.24f, 0.23f, 1f));
+        ImGui.PushStyleColor(ImGuiCol.FrameBgActive, new Vector4(0.16f, 0.32f, 0.30f, 1f));
+        ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.10f, 0.20f, 0.21f, 1f));
+        ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new Vector4(0.16f, 0.52f, 0.48f, 1f));
+        ImGui.PushStyleColor(ImGuiCol.ButtonActive, new Vector4(0.10f, 0.68f, 0.60f, 1f));
+        ImGui.PushStyleColor(ImGuiCol.CheckMark, new Vector4(0.20f, 0.82f, 0.72f, 1f));
+        ImGui.PushStyleVar(ImGuiStyleVar.FrameRounding, 7f);
+        ImGui.PushStyleVar(ImGuiStyleVar.GrabRounding, 7f);
+        ImGui.PushStyleVar(ImGuiStyleVar.ItemSpacing, new Vector2(10f, 9f));
+        ImGui.PushStyleVar(ImGuiStyleVar.FramePadding, new Vector2(12f, 8f));
         Interlocked.Exchange(ref _lastSettingsGuiTick, Environment.TickCount64);
         NormalizeSettings();
         // UI callbacks can run on ModManager's managed/render thread. Native
@@ -480,7 +501,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
         if (_game?.IsEditorScene() != true)
         {
             ImGui.Separator();
-            if (ImGui.Button(ui.OpenManager))
+            if (ImGui.Button(ui.OpenManager, new Vector2(-1f, GetOverlayButtonHeight())))
                 OpenReplayManager();
 
             ImGui.Separator();
@@ -512,10 +533,9 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
         }
 
         ImGui.Separator();
-        if (ImGui.Button(ui.SaveCurrent))
+        if (ImGui.Button(ui.SaveCurrent, new Vector2(-1f, GetOverlayButtonHeight())))
             QueueSaveCurrent(ui);
-        ImGui.SameLine();
-        if (ImGui.Button(ui.PlayLast))
+        if (ImGui.Button(ui.PlayLast, new Vector2(-1f, GetOverlayButtonHeight())))
             QueuePlayLast(ui);
 
         ReplayRunState runState;
@@ -526,14 +546,15 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
         {
             if (runState is ReplayRunState.Playing or ReplayRunState.Paused)
             {
-                if (ImGui.Button(runState == ReplayRunState.Paused ? ui.Resume : ui.Pause))
+                if (ImGui.Button(runState == ReplayRunState.Paused ? ui.Resume : ui.Pause, new Vector2(-1f, GetOverlayButtonHeight())))
                     _commands.Enqueue(new ReplayCommand(ReplayCommandKind.TogglePause));
-                ImGui.SameLine();
             }
-            if (ImGui.Button(ui.Stop))
+            if (ImGui.Button(ui.Stop, new Vector2(-1f, GetOverlayButtonHeight())))
                 _commands.Enqueue(new ReplayCommand(ReplayCommandKind.Stop));
         }
         _updateService?.DrawGui();
+        ImGui.PopStyleVar(4);
+        ImGui.PopStyleColor(9);
     }
 
     internal bool ShouldBlockPlayerHit(nint player)
@@ -709,6 +730,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
     {
         if (_game == null)
             return;
+        GameApi game = _game;
 
         _controller = controller;
         _levelTransitionInProgress = false;
@@ -719,6 +741,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
 
         bool activated = false;
         bool restarted = false;
+        ReplayData? playbackToStart = null;
 
         lock (_stateLock)
         {
@@ -732,6 +755,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
                 _replayIndex = 0;
                 _recording = false;
                 _runState = ReplayRunState.WaitingForStart;
+                playbackToStart = _activeReplay;
                 activated = true;
             }
             else if (_activeReplay != null
@@ -740,6 +764,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
                 _replayIndex = 0;
                 _recording = false;
                 _runState = ReplayRunState.WaitingForStart;
+                playbackToStart = _activeReplay;
                 restarted = true;
             }
             else if (_runState is ReplayRunState.Finished or ReplayRunState.Failed)
@@ -751,13 +776,17 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
 
         if (activated)
         {
-            _game?.CancelPendingCustomReplayLoad();
+            game.CancelPendingCustomReplayLoad();
+            if (playbackToStart != null)
+                game.SetDifficulty(playbackToStart.Difficulty);
             BeginReplayInputPlayback();
             Logger.Info(LogTag, "Replay activated after level load");
             return;
         }
         if (restarted)
         {
+            if (playbackToStart != null)
+                game.SetDifficulty(playbackToStart.Difficulty);
             BeginReplayInputPlayback();
             return;
         }
@@ -945,9 +974,50 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
                     break;
             }
         }
+        SyncReplayDifficultySelector(_game);
         TickReplayAudioPreview();
         AdvancePendingReplayLoad();
         EnsureAttemptStarted(controller);
+    }
+
+    private void SyncReplayDifficultySelector(GameApi? game)
+    {
+        if (game == null)
+            return;
+
+        bool replayPending;
+        lock (_stateLock)
+        {
+            replayPending = _activeReplay != null || _pendingReplay != null;
+        }
+
+        if (!replayPending)
+        {
+            if (_replayDifficultySelectorShown)
+                MinimizeReplayDifficultySelector(game);
+            return;
+        }
+
+        // The native Show -> Minimize sequence initializes the original text
+        // and difficulty image, then leaves the compact status-only control.
+        // It is intentionally independent of Loading/Waiting/Playing state;
+        // the compact control is not the interactive pre-start panel.
+        if (!_replayDifficultySelectorShown)
+            ShowReplayDifficultyCompact(game);
+    }
+
+    private void ShowReplayDifficultyCompact(GameApi game)
+    {
+        if (!game.ShowReplayDifficultyCompact())
+            return;
+        _replayDifficultySelectorShown = true;
+    }
+
+    private void MinimizeReplayDifficultySelector(GameApi game)
+    {
+        if (!game.MinimizeReplayDifficultySelector())
+            return;
+        _replayDifficultySelectorShown = false;
     }
 
 
@@ -1012,6 +1082,8 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
     private void FailPendingReplayLoad(string error)
     {
         EndReplayInputPlayback();
+        if (_game != null)
+            MinimizeReplayDifficultySelector(_game);
         _game?.CancelPendingCustomReplayLoad();
         lock (_stateLock)
         {
@@ -1101,13 +1173,15 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
         ResumeReplayClock();
         _controller = controller;
         _player = player;
-        // 编辑器 currentState 始终为 None，playMode 又会在倒计时前提前为 true。
-        // hasSongStarted 由 scrConductor.Rewind 清零，并在真正调度音乐后置位，
-        // 是不会提前消费编辑器回放输入的可靠开闸信号。
-        if (editorReplay && !game.HasSongStarted())
+        // scrConductor.Rewind clears hasSongStarted and the conductor sets it
+        // only when the song really begins. Use it for both normal and editor
+        // replays so input injection never consumes events during the
+        // ready/countdown phase.
+        if (!game.HasSongStarted())
             return;
         if (state == ReplayRunState.WaitingForStart)
         {
+            ShowReplayDifficultyCompact(game);
             lock (_stateLock)
             {
                 _runState = ReplayRunState.Playing;
@@ -1434,6 +1508,8 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
         {
             lock (_stateLock)
                 _runState = ReplayRunState.Failed;
+            if (_game != null)
+                MinimizeReplayDifficultySelector(_game);
             return true;
         }
 
@@ -1456,6 +1532,8 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
         {
             lock (_stateLock)
                 _runState = ReplayRunState.Finished;
+            if (_game != null)
+                MinimizeReplayDifficultySelector(_game);
             return true;
         }
 
@@ -1479,6 +1557,8 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
     internal void ReleaseReplayAfterResult(string result)
     {
         EndReplayInputPlayback();
+        if (_replayDifficultySelectorShown && _game != null)
+            MinimizeReplayDifficultySelector(_game);
         bool released;
         lock (_stateLock)
         {
@@ -1524,6 +1604,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             IsOfficialLevel = identity.IsOfficialLevel,
             Speed = game.GetPitch(),
             Bpm = game.GetBpm(),
+            Difficulty = game.GetDifficulty(),
             StartTile = Math.Max(0, startTile),
             EndTile = Math.Max(0, startTile),
             TotalTiles = identity.TotalTiles,
@@ -1543,7 +1624,8 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
         Logger.Info(
             LogTag,
             $"Recording started: {attempt.SongName}, official={attempt.IsOfficialLevel}, "
-            + $"level='{attempt.LevelId}', path='{attempt.LevelPath}', tile {attempt.StartTile}");
+            + $"level='{attempt.LevelId}', path='{attempt.LevelPath}', "
+            + $"tile {attempt.StartTile}, difficulty={attempt.Difficulty}");
     }
 
     private ReplayData? FinalizeAttempt(bool completed, nint controller)
@@ -1602,6 +1684,8 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             return;
         lock (_stateLock)
             _runState = ReplayRunState.Finished;
+        if (_game != null)
+            MinimizeReplayDifficultySelector(_game);
     }
 
     private void QueueSaveCurrent(UiText ui)
@@ -1721,7 +1805,10 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             lock (_stateLock)
             {
                 if (_resultAttempt?.SessionId == replay.SessionId)
+                {
                     _resultAttemptSaved = true;
+                    _resultSaveButtonUntilUtc = DateTime.UtcNow.AddSeconds(5);
+                }
                 _resultSaveQueued = false;
             }
             return true;
@@ -1783,6 +1870,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             return;
 
         StopPlaybackNow(resumeRecording: false);
+        _replayDifficultySelectorShown = false;
         ReplayData pendingReplay = CloneReplay(replay)!;
         RepairLegacyStartTile(pendingReplay);
         lock (_stateLock)
@@ -1803,7 +1891,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             LogTag,
             $"Loading replay: {replay.SongName}, {replay.Hits.Count} hits, "
             + $"official={replay.IsOfficialLevel}, level='{replay.LevelId}', "
-            + $"scene='{replay.SceneName}', path='{replay.LevelPath}'");
+            + $"scene='{replay.SceneName}', path='{replay.LevelPath}', difficulty={replay.Difficulty}");
 
         if (!game.LoadReplayLevel(pendingReplay))
         {
@@ -1871,6 +1959,8 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
     {
         EndReplayInputPlayback();
         GameApi? game = _game;
+        if (game != null)
+            MinimizeReplayDifficultySelector(game);
         game?.CancelPendingCustomReplayLoad();
         nint controller = game?.GetController() ?? 0;
         // 编辑器预览页的 gameworld 也是 true，而 set_paused(false) 会直接把预览页
@@ -2051,6 +2141,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             _deletePopupRequested = false;
             _editingReplayPath = "";
             _replayTitleEdit = "";
+            _managerTitleEditing = false;
         }
         StopManagerPreview();
         if (resume)
@@ -2102,8 +2193,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
     private void DrawIslandEntry()
     {
         GameApi? game = _game;
-        bool customLevelSelect = game?.IsCustomLevelSelect() == true;
-        bool editorScene = !customLevelSelect && game?.IsEditorScene() == true;
+        bool editorScene = game?.IsEditorScene() == true;
         if (editorScene)
         {
             // 编辑器内不显示回放管理入口。编辑器的开始/停止由游戏自身
@@ -2111,7 +2201,9 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             _islandEntryLogged = false;
             return;
         }
-        bool entryScene = customLevelSelect || game?.IsLevelSelect() == true;
+        // Only show the entry on the normal main/level-select page. It must
+        // not appear in the custom-level browser or during gameplay.
+        bool entryScene = game?.IsLevelSelect() == true;
         if (!entryScene)
             _islandEntryLogged = false;
         ImGuiIOPtr io = ImGui.GetIO();
@@ -2129,17 +2221,34 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             return;
         ImGuiStylePtr style = ImGui.GetStyle();
         float margin = GetOverlayMargin();
-        float buttonHeight = GetOverlayButtonHeight();
-        float desiredWidth = ImGui.CalcTextSize(ui.IslandEntry).X
+        float buttonHeight = Math.Max(46f, ImGui.GetFrameHeight() * 1.25f);
+        string entryLabel = ui.IslandEntry;
+        float desiredWidth = ImGui.CalcTextSize(entryLabel).X
             + style.FramePadding.X * 2f
             + style.WindowPadding.X * 2f;
-        float width = ClampOverlayWidth(display.X, margin, 180f, desiredWidth);
-        Vector2 size = new(width, GetOverlayWindowHeight(buttonHeight));
+        float width = ClampOverlayWidth(display.X, margin, 220f, desiredWidth);
+        Vector2 size = new(width, buttonHeight + style.WindowPadding.Y * 2f);
         float posX = display.X - size.X - margin;
         float posY = display.Y - size.Y - margin;
         ImGui.SetNextWindowPos(new Vector2(posX, posY), ImGuiCond.Always);
         ImGui.SetNextWindowSize(size, ImGuiCond.Always);
-        ImGui.SetNextWindowBgAlpha(0.88f);
+        ImGui.SetNextWindowBgAlpha(0.96f);
+        Vector4 accent = new(0.98f, 0.43f, 0.52f, 1f);
+        int colorCount = 0;
+        ImGui.PushStyleColor(ImGuiCol.WindowBg, new Vector4(0.10f, 0.075f, 0.11f, 0.96f));
+        colorCount++;
+        ImGui.PushStyleColor(ImGuiCol.Border, accent);
+        colorCount++;
+        ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.22f, 0.13f, 0.18f, 1f));
+        colorCount++;
+        ImGui.PushStyleColor(ImGuiCol.ButtonHovered, accent);
+        colorCount++;
+        ImGui.PushStyleColor(ImGuiCol.ButtonActive, new Vector4(0.84f, 0.27f, 0.37f, 1f));
+        colorCount++;
+        ImGui.PushStyleColor(ImGuiCol.Text, new Vector4(1f, 0.92f, 0.95f, 1f));
+        colorCount++;
+        ImGui.PushStyleVar(ImGuiStyleVar.WindowRounding, 8f);
+        ImGui.PushStyleVar(ImGuiStyleVar.FrameRounding, 6f);
         ImGuiWindowFlags flags = ImGuiWindowFlags.NoTitleBar
             | ImGuiWindowFlags.NoResize
             | ImGuiWindowFlags.NoMove
@@ -2147,17 +2256,16 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             | ImGuiWindowFlags.NoScrollbar;
         if (ImGui.Begin("##ReplayMainEntry", flags))
         {
-            if (ImGui.Button(ui.IslandEntry, new Vector2(-1f, buttonHeight)))
+            if (ImGui.Button(entryLabel, new Vector2(-1f, buttonHeight)))
                 OpenReplayManager();
         }
         ImGui.End();
+        ImGui.PopStyleVar(2);
+        ImGui.PopStyleColor(colorCount);
         if (!_islandEntryLogged)
         {
             _islandEntryLogged = true;
-            Logger.Info(
-                LogTag,
-                customLevelSelect ? "Replay custom-level-page entry is available"
-                    : "Replay main-page entry is available");
+            Logger.Info(LogTag, "Replay main-page entry is available");
         }
     }
 
@@ -2181,22 +2289,39 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
         UiText ui = UiText.FromLanguage(_languageCode);
         ImGuiStylePtr style = ImGui.GetStyle();
         float margin = GetOverlayMargin();
-        float buttonHeight = GetOverlayButtonHeight();
+        float buttonHeight = Math.Max(48f, ImGui.GetFrameHeight() * 1.25f);
+        float headerHeight = Math.Max(44f, ImGui.GetFrameHeight() * 1.22f);
         string primaryLabel = state == ReplayRunState.Paused ? ui.Resume : ui.Pause;
+        string stateLabel = state switch
+        {
+            ReplayRunState.Paused => ui.ReplayPaused,
+            ReplayRunState.Finished => ui.ReplayFinished,
+            ReplayRunState.Failed => ui.ReplayFailed,
+            ReplayRunState.WaitingForStart => ui.ReplayWaiting,
+            _ => ui.Replaying,
+        };
+        float buttonWidth = Math.Max(
+            110f,
+            Math.Max(ImGui.CalcTextSize(primaryLabel).X, ImGui.CalcTextSize(ui.Stop).X)
+                + style.FramePadding.X * 4f);
+        float bodyContentHeight = buttonHeight
+            + style.WindowPadding.Y * 2f
+            + style.ItemSpacing.Y;
+        float headerWidth = ImGui.CalcTextSize(stateLabel).X
+            + ImGui.CalcTextSize("REPLAY").X
+            + 76f;
         float desiredWidth = state is ReplayRunState.Playing or ReplayRunState.Paused
-            ? ImGui.CalcTextSize(primaryLabel).X
-                + ImGui.CalcTextSize(ui.Stop).X
-                + style.FramePadding.X * 4f
-                + style.ItemSpacing.X
-                + style.WindowPadding.X * 2f
-            : ImGui.CalcTextSize(ui.Stop).X
-                + style.FramePadding.X * 2f
-                + style.WindowPadding.X * 2f;
-        float width = ClampOverlayWidth(display.X, margin, 250f, desiredWidth);
-        Vector2 size = new(width, GetOverlayWindowHeight(buttonHeight));
+            ? Math.Max(headerWidth, buttonWidth * 2f + style.ItemSpacing.X)
+            : Math.Max(headerWidth, buttonWidth);
+        float width = ClampOverlayWidth(display.X, margin, 280f, desiredWidth);
+        float sizeHeight = headerHeight
+            + (_replayControlsExpanded ? bodyContentHeight : 0f)
+            + style.WindowPadding.Y * 2f;
+        Vector2 size = new(width, sizeHeight + style.WindowPadding.Y);
         ImGui.SetNextWindowPos(new Vector2(margin, display.Y - size.Y - margin), ImGuiCond.Always);
         ImGui.SetNextWindowSize(size, ImGuiCond.Always);
-        ImGui.SetNextWindowBgAlpha(0.9f);
+        ImGui.SetNextWindowBgAlpha(0.96f);
+        PushReplayOverlayTheme(out int colorCount, out int styleCount);
         ImGuiWindowFlags flags = ImGuiWindowFlags.NoTitleBar
             | ImGuiWindowFlags.NoResize
             | ImGuiWindowFlags.NoMove
@@ -2204,21 +2329,86 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             | ImGuiWindowFlags.NoScrollbar;
         if (ImGui.Begin("##ReplayControls", flags))
         {
-            if (state is ReplayRunState.Playing or ReplayRunState.Paused)
+            if (ImGui.BeginChild(
+                    "##ReplayControlsHeader",
+                    new Vector2(0f, headerHeight),
+                    ImGuiChildFlags.None,
+                    ImGuiWindowFlags.NoScrollbar))
             {
-                float buttonWidth = Math.Max(
-                    70f,
-                    (ImGui.GetContentRegionAvail().X - ImGui.GetStyle().ItemSpacing.X) * 0.5f);
-                if (ImGui.Button(primaryLabel, new Vector2(buttonWidth, buttonHeight)))
-                    _commands.Enqueue(new ReplayCommand(ReplayCommandKind.TogglePause));
+                ImGui.TextColored(new Vector4(0.98f, 0.43f, 0.52f, 1f), "REPLAY");
                 ImGui.SameLine();
-                if (ImGui.Button(ui.Stop, new Vector2(buttonWidth, buttonHeight)))
-                    _commands.Enqueue(new ReplayCommand(ReplayCommandKind.Stop));
+                ImGui.TextDisabled(stateLabel);
+                float toggleWidth = 38f;
+                ImGui.SameLine();
+                ImGui.SetCursorPosX(Math.Max(ImGui.GetCursorPosX(), ImGui.GetWindowWidth() - toggleWidth - 4f));
+                bool toggleClicked = ImGui.Button(
+                    "##ReplayControlsToggle",
+                    new Vector2(toggleWidth, headerHeight - 8f));
+                Vector2 toggleMin = ImGui.GetItemRectMin();
+                Vector2 toggleMax = ImGui.GetItemRectMax();
+                DrawReplayControlsChevron(
+                    ImGui.GetWindowDrawList(),
+                    (toggleMin + toggleMax) * 0.5f,
+                    _replayControlsExpanded,
+                    ImGui.ColorConvertFloat4ToU32(new Vector4(1f, 0.80f, 0.86f, 1f)));
+                if (toggleClicked)
+                    _replayControlsExpanded = !_replayControlsExpanded;
             }
-            else if (ImGui.Button(ui.Stop, new Vector2(-1f, buttonHeight)))
-                _commands.Enqueue(new ReplayCommand(ReplayCommandKind.Stop));
+            ImGui.EndChild();
+
+            if (_replayControlsExpanded)
+            {
+                if (ImGui.BeginChild(
+                        "##ReplayControlsBody",
+                        new Vector2(0f, bodyContentHeight),
+                        ImGuiChildFlags.AlwaysUseWindowPadding,
+                        ImGuiWindowFlags.NoScrollbar))
+                {
+                    ImGui.Separator();
+                    if (state is ReplayRunState.Playing or ReplayRunState.Paused)
+                    {
+                        float rowWidth = ImGui.GetContentRegionAvail().X;
+                        float actionWidth = Math.Max(
+                            1f,
+                            (rowWidth - style.ItemSpacing.X) * 0.5f);
+                        if (ImGui.Button(primaryLabel, new Vector2(actionWidth, buttonHeight)))
+                            _commands.Enqueue(new ReplayCommand(ReplayCommandKind.TogglePause));
+                        ImGui.SameLine();
+                        if (ImGui.Button(ui.Stop, new Vector2(actionWidth, buttonHeight)))
+                            _commands.Enqueue(new ReplayCommand(ReplayCommandKind.Stop));
+                    }
+                    else if (ImGui.Button(ui.Stop, new Vector2(-1f, buttonHeight)))
+                    {
+                        _commands.Enqueue(new ReplayCommand(ReplayCommandKind.Stop));
+                    }
+                }
+                ImGui.EndChild();
+            }
         }
         ImGui.End();
+        PopReplayOverlayTheme(colorCount, styleCount);
+    }
+    private static void DrawReplayControlsChevron(
+        ImDrawListPtr drawList,
+        Vector2 center,
+        bool expanded,
+        uint color)
+    {
+        float size = 6f;
+        if (expanded)
+        {
+            drawList.AddLine(center + new Vector2(-size, -size * 0.35f),
+                center + new Vector2(0f, size * 0.45f), color, 2f);
+            drawList.AddLine(center + new Vector2(0f, size * 0.45f),
+                center + new Vector2(size, -size * 0.35f), color, 2f);
+        }
+        else
+        {
+            drawList.AddLine(center + new Vector2(-size * 0.35f, -size),
+                center + new Vector2(size * 0.45f, 0f), color, 2f);
+            drawList.AddLine(center + new Vector2(size * 0.45f, 0f),
+                center + new Vector2(-size * 0.35f, size), color, 2f);
+        }
     }
 
     private void DrawResultSaveButton()
@@ -2240,6 +2430,12 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
                 && !_recording;
             saved = _resultAttemptSaved;
             queued = _resultSaveQueued;
+            if (saved
+                && _resultSaveButtonUntilUtc != default
+                && DateTime.UtcNow >= _resultSaveButtonUntilUtc)
+            {
+                visible = false;
+            }
         }
         if (!visible)
             return;
@@ -2251,15 +2447,28 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
         ImGuiStylePtr style = ImGui.GetStyle();
         float margin = GetOverlayMargin();
         float buttonHeight = GetOverlayButtonHeight();
-        string label = saved ? ui.ResultSaved : queued ? ui.SavingResult : ui.SaveResult;
-        float desiredWidth = ImGui.CalcTextSize(label).X
-            + style.FramePadding.X * 2f
+        string label = SanitizeImGuiText(saved ? ui.ResultSaved : queued ? ui.SavingResult : ui.SaveResult);
+        string statusLabel = SanitizeImGuiText(saved ? ui.ResultSaved : ui.SaveResult);
+        float headerWidth = ImGui.CalcTextSize("RESULT").X
+            + style.ItemSpacing.X
+            + ImGui.CalcTextSize(statusLabel).X;
+        float actionWidth = ImGui.CalcTextSize(label).X + style.FramePadding.X * 2f;
+        float desiredWidth = Math.Max(headerWidth, actionWidth)
             + style.WindowPadding.X * 2f;
-        float width = ClampOverlayWidth(display.X, margin, 220f, desiredWidth);
-        Vector2 size = new(width, GetOverlayWindowHeight(buttonHeight));
+        float width = ClampOverlayWidth(
+            display.X,
+            margin,
+            Math.Min(220f, desiredWidth),
+            desiredWidth);
+        float contentHeight = ImGui.GetTextLineHeightWithSpacing()
+            + style.ItemSpacing.Y
+            + 1f
+            + buttonHeight;
+        Vector2 size = new(width, contentHeight + style.WindowPadding.Y * 2f);
         ImGui.SetNextWindowPos(new Vector2(margin, display.Y - size.Y - margin), ImGuiCond.Always);
         ImGui.SetNextWindowSize(size, ImGuiCond.Always);
-        ImGui.SetNextWindowBgAlpha(0.9f);
+        ImGui.SetNextWindowBgAlpha(0.96f);
+        PushReplayOverlayTheme(out int colorCount, out int styleCount);
         ImGuiWindowFlags flags = ImGuiWindowFlags.NoTitleBar
             | ImGuiWindowFlags.NoResize
             | ImGuiWindowFlags.NoMove
@@ -2267,7 +2476,12 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             | ImGuiWindowFlags.NoScrollbar;
         if (ImGui.Begin("##ReplayResultSave", flags))
         {
-            if (ImGui.Button(label, new Vector2(-1f, buttonHeight)) && !saved && !queued)
+            ImGui.TextColored(new Vector4(0.98f, 0.43f, 0.52f, 1f), "RESULT");
+            ImGui.SameLine();
+            ImGui.TextDisabled(saved ? ui.ResultSaved : ui.SaveResult);
+            ImGui.Separator();
+            float buttonWidth = Math.Max(1f, ImGui.GetContentRegionAvail().X);
+            if (ImGui.Button(label, new Vector2(buttonWidth, buttonHeight)) && !saved && !queued)
             {
                 lock (_stateLock)
                     _resultSaveQueued = true;
@@ -2275,6 +2489,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             }
         }
         ImGui.End();
+        PopReplayOverlayTheme(colorCount, styleCount);
     }
 
     private void DrawToast()
@@ -2295,6 +2510,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
         if (string.IsNullOrEmpty(toast))
             return;
 
+        toast = SanitizeImGuiText(toast);
         Vector2 display = ImGui.GetIO().DisplaySize;
         if (display.X < 180f || display.Y < 100f)
             return;
@@ -2307,7 +2523,8 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
         Vector2 size = new(width, Math.Max(64f, textHeight + style.WindowPadding.Y * 2f));
         ImGui.SetNextWindowPos(new Vector2((display.X - size.X) * 0.5f, margin), ImGuiCond.Always);
         ImGui.SetNextWindowSize(size, ImGuiCond.Always);
-        ImGui.SetNextWindowBgAlpha(0.94f);
+        ImGui.SetNextWindowBgAlpha(0.96f);
+        PushReplayOverlayTheme(out int colorCount, out int styleCount);
         ImGuiWindowFlags flags = ImGuiWindowFlags.NoTitleBar
             | ImGuiWindowFlags.NoResize
             | ImGuiWindowFlags.NoMove
@@ -2315,8 +2532,13 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             | ImGuiWindowFlags.NoScrollbar
             | ImGuiWindowFlags.NoInputs;
         if (ImGui.Begin("##ReplayToast", flags))
+        {
+            DrawNoticeIcon(ImGui.GetWindowDrawList(), ImGui.GetCursorScreenPos());
+            ImGui.SameLine(0f, 10f);
             ImGui.TextWrapped(toast);
+        }
         ImGui.End();
+        PopReplayOverlayTheme(colorCount, styleCount);
     }
 
     private static float GetOverlayMargin()
@@ -2340,6 +2562,33 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
         return Math.Min(available, Math.Max(Math.Min(minimum, available), desired));
     }
 
+    private static void PushReplayOverlayTheme(out int colorCount, out int styleCount)
+    {
+        Vector4 accent = new(0.98f, 0.43f, 0.52f, 1f);
+        colorCount = 0;
+        ImGui.PushStyleColor(ImGuiCol.WindowBg, new Vector4(0.10f, 0.075f, 0.11f, 0.96f));
+        colorCount++;
+        ImGui.PushStyleColor(ImGuiCol.Border, new Vector4(0.42f, 0.28f, 0.36f, 1f));
+        colorCount++;
+        ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.22f, 0.13f, 0.18f, 1f));
+        colorCount++;
+        ImGui.PushStyleColor(ImGuiCol.ButtonHovered, accent);
+        colorCount++;
+        ImGui.PushStyleColor(ImGuiCol.ButtonActive, new Vector4(0.84f, 0.27f, 0.37f, 1f));
+        colorCount++;
+        ImGui.PushStyleColor(ImGuiCol.Text, new Vector4(1f, 0.92f, 0.95f, 1f));
+        colorCount++;
+        ImGui.PushStyleVar(ImGuiStyleVar.WindowRounding, 8f);
+        ImGui.PushStyleVar(ImGuiStyleVar.FrameRounding, 6f);
+        styleCount = 2;
+    }
+
+    private static void PopReplayOverlayTheme(int colorCount, int styleCount)
+    {
+        ImGui.PopStyleVar(styleCount);
+        ImGui.PopStyleColor(colorCount);
+    }
+
     private void DrawReplayManager()
     {
         if (!_managerOpen)
@@ -2350,81 +2599,394 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
         if (display.X <= 0f || display.Y <= 0f)
             return;
 
-        ImGuiStylePtr baseStyle = ImGui.GetStyle();
-        ImGui.PushStyleVar(
-            ImGuiStyleVar.WindowPadding,
-            new Vector2(Math.Max(baseStyle.WindowPadding.X, 18f), Math.Max(baseStyle.WindowPadding.Y, 14f)));
-        ImGui.PushStyleVar(
-            ImGuiStyleVar.FramePadding,
-            new Vector2(Math.Max(baseStyle.FramePadding.X, 14f), Math.Max(baseStyle.FramePadding.Y, 9f)));
-        ImGui.PushStyleVar(
-            ImGuiStyleVar.ItemSpacing,
-            new Vector2(Math.Max(baseStyle.ItemSpacing.X, 12f), Math.Max(baseStyle.ItemSpacing.Y, 10f)));
-        ImGui.PushStyleVar(ImGuiStyleVar.FrameRounding, Math.Max(baseStyle.FrameRounding, 6f));
-        ImGui.PushStyleVar(ImGuiStyleVar.SelectableTextAlign, new Vector2(0f, 0.5f));
+        Vector4 ink = new(0.92f, 0.96f, 0.95f, 1f);
+        Vector4 muted = new(0.58f, 0.68f, 0.67f, 1f);
+        Vector4 accent = new(0.98f, 0.43f, 0.52f, 1f);
+        Vector4 surface = new(0.10f, 0.075f, 0.11f, 0.99f);
+        Vector4 surfaceRaised = new(0.18f, 0.13f, 0.19f, 1f);
+        Vector4 surfaceHover = new(0.30f, 0.18f, 0.25f, 1f);
+        int colors = 0;
+        ImGui.PushStyleColor(ImGuiCol.WindowBg, surface); colors++;
+        ImGui.PushStyleColor(ImGuiCol.ChildBg, surface); colors++;
+        ImGui.PushStyleColor(ImGuiCol.Text, ink); colors++;
+        ImGui.PushStyleColor(ImGuiCol.TextDisabled, muted); colors++;
+        ImGui.PushStyleColor(ImGuiCol.Border, new Vector4(0.16f, 0.28f, 0.28f, 1f)); colors++;
+        ImGui.PushStyleColor(ImGuiCol.Separator, new Vector4(0.16f, 0.28f, 0.28f, 1f)); colors++;
+        ImGui.PushStyleColor(ImGuiCol.FrameBg, surfaceRaised); colors++;
+        ImGui.PushStyleColor(ImGuiCol.FrameBgHovered, surfaceHover); colors++;
+        ImGui.PushStyleColor(ImGuiCol.FrameBgActive, new Vector4(0.17f, 0.32f, 0.31f, 1f)); colors++;
+        ImGui.PushStyleColor(ImGuiCol.Button, surfaceRaised); colors++;
+        ImGui.PushStyleColor(ImGuiCol.ButtonHovered, surfaceHover); colors++;
+        ImGui.PushStyleColor(ImGuiCol.ButtonActive, new Vector4(0.12f, 0.62f, 0.56f, 1f)); colors++;
+        ImGui.PushStyleColor(ImGuiCol.Header, new Vector4(0.10f, 0.25f, 0.24f, 1f)); colors++;
+        ImGui.PushStyleColor(ImGuiCol.HeaderHovered, surfaceHover); colors++;
+        ImGui.PushStyleColor(ImGuiCol.HeaderActive, new Vector4(0.12f, 0.62f, 0.56f, 1f)); colors++;
+        ImGui.PushStyleVar(ImGuiStyleVar.WindowPadding, new Vector2(22f, 18f));
+        ImGui.PushStyleVar(ImGuiStyleVar.FramePadding, new Vector2(14f, 10f));
+        ImGui.PushStyleVar(ImGuiStyleVar.ItemSpacing, new Vector2(12f, 12f));
+        ImGui.PushStyleVar(ImGuiStyleVar.FrameRounding, 8f);
+        ImGui.PushStyleVar(ImGuiStyleVar.ChildRounding, 10f);
+        ImGui.PushStyleVar(ImGuiStyleVar.WindowRounding, 0f);
+
         ImGui.SetNextWindowPos(Vector2.Zero, ImGuiCond.Always);
         ImGui.SetNextWindowSize(display, ImGuiCond.Always);
-        ImGui.SetNextWindowBgAlpha(0.97f);
         bool open = true;
-        ImGuiWindowFlags flags = ImGuiWindowFlags.NoCollapse
-            | ImGuiWindowFlags.NoResize
-            | ImGuiWindowFlags.NoMove
-            | ImGuiWindowFlags.NoSavedSettings;
-        if (ImGui.Begin($"{ui.ManagerTitle}###ReplayManager", ref open, flags))
+        ImGuiWindowFlags flags = ImGuiWindowFlags.NoTitleBar | ImGuiWindowFlags.NoResize
+            | ImGuiWindowFlags.NoMove | ImGuiWindowFlags.NoSavedSettings;
+        if (ImGui.Begin("###ReplayManager", ref open, flags))
         {
-            ImGui.SetWindowFontScale(1.06f);
-            List<ReplayFileEntry> files;
-            lock (_stateLock)
-                files = _files.ToList();
-            ReplayFileEntry? selected = files.FirstOrDefault(entry =>
-                string.Equals(entry.Path, _selectedReplayPath, StringComparison.Ordinal));
-            if (_managerShowingDetails && selected != null)
+            // Compact app bar: title, current version, and one clear close action.
+            ImGui.TextColored(accent, "REPLAY");
+            ImGui.SameLine(0f, 10f);
+            ImGui.TextUnformatted(ui.ManagerTitle);
+            ImGui.SameLine(0f, 10f);
+            ImGui.TextDisabled($"v{Version}");
+            ImGui.SameLine();
+            ImGui.SetCursorPosX(ImGui.GetWindowWidth() - 78f);
+            if (DrawIconButton("close", "##manager-close", new Vector2(72f, 48f)))
+                open = false;
+            ImGui.Separator();
+
+            // Horizontal segmented navigation keeps the content wide and avoids a permanent sidebar.
+            float tabWidth = Math.Max(1f, (ImGui.GetContentRegionAvail().X - 24f) / 3f);
+            if (DrawReplayTopTab(ui.ManagerTitle, 0, _managerSection == 0, tabWidth)) _managerSection = 0;
+            ImGui.SameLine();
+            if (DrawReplayTopTab(GetManagerSettingsLabel(), 1, _managerSection == 1, tabWidth)) _managerSection = 1;
+            ImGui.SameLine();
+            if (DrawReplayTopTab(GetManagerUpdatesLabel(), 2, _managerSection == 2, tabWidth)) _managerSection = 2;
+            ImGui.Spacing();
+
+            if (ImGui.BeginChild("##ReplayManagerContent", Vector2.Zero,
+                    ImGuiChildFlags.Borders | ImGuiChildFlags.AlwaysUseWindowPadding,
+                    ImGuiWindowFlags.AlwaysVerticalScrollbar))
             {
-                DrawReplayDetailsPage(ui, selected, ref open);
-            }
-            else
-            {
-                _managerShowingDetails = false;
-                StopManagerPreview();
-                DrawReplayListPage(ui, files, ref open);
+                if (_managerSection == 1)
+                    DrawReplayManagerSettings(ui);
+                else if (_managerSection == 2)
+                    DrawReplayManagerUpdates();
+                else
+                {
+                    List<ReplayFileEntry> files;
+                    lock (_stateLock) files = _files.ToList();
+                    ReplayFileEntry? selected = files.FirstOrDefault(entry =>
+                        string.Equals(entry.Path, _selectedReplayPath, StringComparison.Ordinal));
+                    if (_managerShowingDetails && selected != null)
+                        DrawReplayDetailsPage(ui, selected, ref open);
+                    else
+                    {
+                        _managerShowingDetails = false;
+                        StopManagerPreview();
+                        DrawReplayListPage(ui, files, ref open);
+                    }
+                }
+                ImGui.EndChild();
             }
         }
         ImGui.End();
-        ImGui.PopStyleVar(5);
+        ImGui.PopStyleVar(6);
+        ImGui.PopStyleColor(colors);
         if (!open)
             CloseReplayManager();
+    }
+
+
+    private static bool DrawReplayTopTab(string label, int id, bool active, float width)
+    {
+        Vector2 min = ImGui.GetCursorScreenPos();
+        bool clicked = ImGui.InvisibleButton($"##replay-tab-{id}", new Vector2(width, 42f));
+        bool hovered = ImGui.IsItemHovered();
+        Vector4 fill = active
+            ? new Vector4(0.38f, 0.17f, 0.27f, 1f)
+            : hovered ? new Vector4(0.24f, 0.14f, 0.21f, 1f) : new Vector4(0.16f, 0.11f, 0.16f, 1f);
+        uint color = ImGui.ColorConvertFloat4ToU32(fill);
+        ImDrawListPtr draw = ImGui.GetWindowDrawList();
+        draw.AddRectFilled(min, min + new Vector2(width, 42f), color, 7f);
+        if (active)
+            draw.AddRectFilled(new Vector2(min.X, min.Y + 38f), new Vector2(min.X + width, min.Y + 42f),
+                ImGui.ColorConvertFloat4ToU32(new Vector4(0.98f, 0.43f, 0.52f, 1f)), 2f);
+        Vector2 text = min + new Vector2((width - ImGui.CalcTextSize(label).X) * 0.5f,
+            (42f - ImGui.GetTextLineHeight()) * 0.5f);
+        draw.AddText(text, ImGui.ColorConvertFloat4ToU32(active
+            ? new Vector4(1f, 0.92f, 0.95f, 1f)
+            : new Vector4(0.72f, 0.66f, 0.72f, 1f)), label);
+        return clicked;
+    }
+
+    private static bool DrawManagerNavigationButton(
+        string icon,
+        string label,
+        bool active,
+        string id)
+    {
+        float height = Math.Max(44f, ImGui.GetFrameHeight() * 1.25f);
+        float width = Math.Max(1f, ImGui.GetContentRegionAvail().X);
+        Vector2 min = ImGui.GetCursorScreenPos();
+        bool clicked = ImGui.InvisibleButton($"##manager-nav-{id}", new Vector2(width, height));
+        bool hovered = ImGui.IsItemHovered();
+        ImDrawListPtr drawList = ImGui.GetWindowDrawList();
+        Vector4 baseColor = active
+            ? new Vector4(0.98f, 0.43f, 0.52f, 1f)
+            : hovered
+                ? new Vector4(0.32f, 0.19f, 0.27f, 1f)
+                : new Vector4(0.14f, 0.10f, 0.15f, 0.92f);
+        uint background = ImGui.ColorConvertFloat4ToU32(baseColor);
+        drawList.AddRectFilled(min, min + new Vector2(width, height), background, 6f);
+        float iconSize = Math.Min(26f, height - 12f);
+        Vector2 center = min + new Vector2(16f + iconSize * 0.5f, height * 0.5f);
+        DrawManagerNavigationIcon(
+            drawList,
+            icon,
+            center,
+            iconSize * 0.5f,
+            ImGui.ColorConvertFloat4ToU32(new Vector4(1f, 0.75f, 0.82f, 1f)));
+        float availableTextWidth = Math.Max(20f, width - iconSize - 42f);
+        string displayLabel = EllipsizeManagerText(
+            SanitizeImGuiText(label),
+            availableTextWidth);
+        drawList.AddText(
+            ImGui.GetFont(),
+            ImGui.GetFontSize(),
+            new Vector2(min.X + iconSize + 28f, min.Y + (height - ImGui.GetTextLineHeight()) * 0.5f),
+            ImGui.ColorConvertFloat4ToU32(new Vector4(1f, 0.94f, 0.97f, 1f)),
+            displayLabel);
+        return clicked;
+    }
+
+    private static void DrawManagerNavigationIcon(
+        ImDrawListPtr drawList,
+        string icon,
+        Vector2 center,
+        float radius,
+        uint color)
+    {
+        switch (icon)
+        {
+            case "replays":
+                Vector2 cardMin = center - new Vector2(radius * 0.72f, radius * 0.58f);
+                Vector2 cardMax = center + new Vector2(radius * 0.72f, radius * 0.58f);
+                drawList.AddRect(cardMin, cardMax, color, 3f, ImDrawFlags.None, 2f);
+                drawList.AddLine(
+                    new Vector2(cardMin.X + radius * 0.2f, cardMin.Y),
+                    new Vector2(cardMin.X + radius * 0.2f, cardMax.Y),
+                    color,
+                    1.5f);
+                drawList.AddTriangleFilled(
+                    center + new Vector2(-radius * 0.18f, -radius * 0.30f),
+                    center + new Vector2(radius * 0.36f, 0f),
+                    center + new Vector2(-radius * 0.18f, radius * 0.30f),
+                    color);
+                break;
+            case "settings":
+                drawList.AddCircle(center, radius * 0.48f, color, 16, 2f);
+                drawList.AddCircleFilled(center, radius * 0.16f, color, 12);
+                for (int index = 0; index < 8; index++)
+                {
+                    float angle = index * MathF.PI / 4f;
+                    Vector2 direction = new(MathF.Cos(angle), MathF.Sin(angle));
+                    drawList.AddLine(
+                        center + direction * radius * 0.62f,
+                        center + direction * radius * 0.92f,
+                        color,
+                        2.5f);
+                }
+                break;
+            default:
+                drawList.AddCircle(center, radius * 0.65f, color, 24, 2f);
+                Vector2 arrowTip = center + new Vector2(radius * 0.70f, -radius * 0.48f);
+                drawList.AddTriangleFilled(
+                    arrowTip,
+                    arrowTip + new Vector2(-radius * 0.12f, radius * 0.45f),
+                    arrowTip + new Vector2(-radius * 0.48f, radius * 0.10f),
+                    color);
+                break;
+        }
+    }
+
+    private string GetDifficultyLabel(int difficulty)
+    {
+        int normalized = Math.Clamp(difficulty, 0, 2);
+        return _languageCode switch
+        {
+            6 or 40 or 41 => normalized switch { 0 => "宽松", 2 => "严格", _ => "普通" },
+            22 => normalized switch { 0 => "ゆるい", 2 => "厳しい", _ => "普通" },
+            23 => normalized switch { 0 => "관대", 2 => "엄격", _ => "일반" },
+            _ => normalized switch { 0 => "Lenient", 2 => "Strict", _ => "Normal" },
+        };
+    }
+
+    private string GetManagerSettingsLabel()
+    {
+        return _languageCode switch
+        {
+            6 or 40 or 41 => "设置",
+            22 => "設定",
+            23 => "설정",
+            _ => "Settings",
+        };
+    }
+
+    private string GetManagerUpdatesLabel()
+    {
+        return _languageCode switch
+        {
+            6 or 40 or 41 => "更新",
+            22 => "更新",
+            23 => "업데이트",
+            _ => "Updates",
+        };
+    }
+
+    private string GetCheckUpdatesLabel()
+    {
+        return _languageCode switch
+        {
+            6 or 40 or 41 => "检查更新",
+            22 => "更新を確認",
+            23 => "업데이트 확인",
+            _ => "Check for updates",
+        };
+    }
+
+    private string GetInstallUpdateLabel()
+    {
+        return _languageCode switch
+        {
+            6 or 40 or 41 => "下载并安装更新",
+            22 => "更新をダウンロードしてインストール",
+            23 => "업데이트 다운로드 및 설치",
+            _ => "Download and install update",
+        };
+    }
+
+    private void DrawReplayManagerSettings(UiText ui)
+    {
+        DrawManagerSectionTitle(GetManagerSettingsLabel());
+        ImGui.TextDisabled("Replay Mobile");
+        bool changed = false;
+        ImGui.BeginChild("##settings-recording", new Vector2(-1f, 0f), ImGuiChildFlags.Borders | ImGuiChildFlags.AutoResizeY);
+        DrawManagerSectionTitle(ui.SaveOptions);
+        changed |= ImGui.Checkbox(ui.SaveFullClear, ref _saveFullClear);
+        changed |= ImGui.Checkbox(ui.SaveEveryCompletion, ref _saveEveryCompletion);
+        changed |= ImGui.Checkbox(ui.SaveEveryFailure, ref _saveEveryFailure);
+        changed |= ImGui.Checkbox(ui.SaveFailureAt90Percent, ref _saveFailureAt90Percent);
+        changed |= ImGui.Checkbox(ui.DisableTutorialAutoSave, ref _disableTutorialAutoSave);
+        ImGui.EndChild();
+        ImGui.Spacing();
+        ImGui.BeginChild("##settings-input", new Vector2(-1f, 0f), ImGuiChildFlags.Borders | ImGuiChildFlags.AutoResizeY);
+        DrawManagerSectionTitle("回放与输入");
+        changed |= ImGui.Checkbox(ui.DisableAutoReplay, ref _ignoreAutoplay);
+        changed |= ImGui.Checkbox(ui.ShowHud, ref _showReplayHud);
+        changed |= ImGui.Checkbox(ui.ReceiveTouchInput, ref _receiveTouchInput);
+        changed |= ImGui.Checkbox(ui.ReceiveKeyboardInput, ref _receiveKeyboardInput);
+        if (_showReplayHud)
+        {
+            changed |= ImGui.SliderInt(ui.HudSize, ref _hudFontSize, 12, 64);
+            changed |= ImGui.SliderFloat("HUD X", ref _hudPositionX, 0f, 1f, "%.2f");
+            changed |= ImGui.SliderFloat("HUD Y", ref _hudPositionY, 0f, 1f, "%.2f");
+        }
+        ImGui.EndChild();
+        ImGui.Spacing();
+        ImGui.BeginChild("##settings-storage", new Vector2(-1f, 0f), ImGuiChildFlags.Borders | ImGuiChildFlags.AutoResizeY);
+        DrawManagerSectionTitle(ui.Directory);
+        changed |= ImGui.SliderInt(ui.MaxFiles, ref _maximumSavedReplays, 1, 500);
+        changed |= ImGui.InputText(ui.Directory, ref _replayDirectory, 512);
+        ImGui.EndChild();
+        if (changed)
+        {
+            NormalizeSettings();
+            SyncInputReceivers();
+            SaveSettings();
+        }
+    }
+
+    private void DrawReplayManagerUpdates()
+    {
+        string updatesLabel = GetManagerUpdatesLabel();
+        DrawManagerSectionTitle(updatesLabel);
+        ImGui.TextDisabled($"Replay Mobile {Version}");
+        ImGui.Separator();
+
+        GitHubUpdateService? updater = _updateService;
+        if (updater == null)
+        {
+            ImGui.TextDisabled("更新服务不可用。");
+            return;
+        }
+
+        ReplayUpdateSnapshot snapshot = updater.GetManagerSnapshot();
+        if (snapshot.Checking || snapshot.Downloading)
+        {
+            ImGui.TextDisabled(SanitizeImGuiText(snapshot.Status));
+            return;
+        }
+
+        if (snapshot.HasUpdate)
+        {
+            ImGui.TextColored(
+                new Vector4(1f, 0.78f, 0.25f, 1f),
+                $"发现新版本：{snapshot.Version}");
+            ImGui.TextDisabled(SanitizeImGuiText(snapshot.Status));
+            if (ImGui.Button(GetInstallUpdateLabel(), new Vector2(-1f, GetManagerButtonHeight())))
+                updater.DownloadUpdate();
+            ImGui.Spacing();
+            DrawManagerSectionTitle($"v{snapshot.Version} 更新日志");
+            ImGui.TextWrapped(string.IsNullOrWhiteSpace(snapshot.Notes)
+                ? "该版本未提供更新日志。"
+                : SanitizeImGuiText(snapshot.Notes));
+        }
+        else
+        {
+            if (snapshot.ReadyToRestart)
+            {
+                ImGui.TextColored(
+                    new Vector4(0.45f, 1f, 0.65f, 1f),
+                    SanitizeImGuiText(snapshot.Status));
+            }
+            else if (snapshot.Failed)
+            {
+                ImGui.TextColored(
+                    new Vector4(1f, 0.4f, 0.4f, 1f),
+                    SanitizeImGuiText(snapshot.Status));
+            }
+            else
+            {
+                ImGui.TextColored(
+                    new Vector4(0.45f, 1f, 0.65f, 1f),
+                    $"当前已是最新版本：{Version}");
+            }
+
+            ImGui.Spacing();
+            DrawManagerSectionTitle($"v{Version} 更新日志");
+            if (string.IsNullOrWhiteSpace(snapshot.Notes))
+                ImGui.TextDisabled("GitHub 未提供该版本的更新日志。");
+            else
+                ImGui.TextWrapped(SanitizeImGuiText(snapshot.Notes));
+        }
+
+        ImGui.Spacing();
+        if (ImGui.Button(GetCheckUpdatesLabel(), new Vector2(-1f, GetManagerButtonHeight())))
+            updater.CheckNow();
     }
 
     private void DrawReplayListPage(UiText ui, List<ReplayFileEntry> files, ref bool open)
     {
         ImGuiStylePtr style = ImGui.GetStyle();
         float buttonHeight = GetManagerButtonHeight();
-        float availableWidth = ImGui.GetContentRegionAvail().X;
-        bool toolbarOnOneLine = CanFitManagerButtonRow(
-            availableWidth,
-            ui.Refresh,
-            ui.SaveCurrent,
-            ui.Close);
-        float toolbarButtonWidth = toolbarOnOneLine
-            ? Math.Max(1f, (availableWidth - style.ItemSpacing.X * 2f) / 3f)
-            : -1f;
-
-        if (ImGui.Button(ui.Refresh, new Vector2(toolbarButtonWidth, buttonHeight)))
+        ImGui.TextColored(new Vector4(0.24f, 0.88f, 0.78f, 1f), ui.ManagerTitle);
+        ImGui.SameLine();
+        ImGui.TextDisabled($"{files.Count}  {ui.Files}");
+        ImGui.SameLine();
+        ImGui.SetCursorPosX(Math.Max(ImGui.GetCursorPosX(), ImGui.GetWindowWidth() - 180f));
+        if (DrawIconButton("refresh", "##replay-refresh", new Vector2(78f, buttonHeight)))
             RefreshFiles();
-        if (toolbarOnOneLine)
-            ImGui.SameLine();
-        if (ImGui.Button(ui.SaveCurrent, new Vector2(toolbarButtonWidth, buttonHeight)))
-            QueueSaveCurrent(ui);
-        if (toolbarOnOneLine)
-            ImGui.SameLine();
-        if (ImGui.Button(ui.Close, new Vector2(toolbarButtonWidth, buttonHeight)))
+        ImGui.SameLine();
+        if (DrawIconButton("close", "##replay-close", new Vector2(78f, buttonHeight)))
             open = false;
 
         ShowNotice();
-        ImGui.Separator();
-        DrawManagerSectionTitle(ui.Search);
+        ImGui.Spacing();
         ImGui.SetNextItemWidth(-1f);
-        ImGui.InputText("##replay-search", ref _fileSearch, 128);
+        ImGui.InputTextWithHint("##replay-search", ui.Search, ref _fileSearch, 128);
 
         string search = _fileSearch.Trim();
         if (!string.IsNullOrEmpty(search))
@@ -2455,26 +3017,80 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
         else
         {
             float rowHeight = Math.Max(
-                buttonHeight,
-                ImGui.GetTextLineHeightWithSpacing() * 2f + style.FramePadding.Y * 2f);
+                92f,
+                ImGui.GetTextLineHeightWithSpacing() * 3f + style.FramePadding.Y * 2f);
             foreach (ReplayFileEntry entry in files)
             {
                 string result = entry.Supported
                     ? entry.Completed ? ui.Complete : ui.Failed
                     : ui.Unsupported;
                 int progress = GetEndProgress(entry);
-                float titleWidth = Math.Max(
-                    80f,
-                    ImGui.GetContentRegionAvail().X - style.FramePadding.X * 2f);
-                string title = EllipsizeManagerText(GetReplayDisplayTitle(entry), titleWidth);
-                string metadata = $"{entry.RecordedAtUtc.ToLocalTime():MM-dd HH:mm}   {result}   {progress}%";
-                string label = $"{title}\n{metadata}##replay-{entry.Path}";
                 float rowWidth = Math.Max(1f, ImGui.GetContentRegionAvail().X);
-                if (!ImGui.Selectable(
-                        label,
-                        string.Equals(_selectedReplayPath, entry.Path, StringComparison.Ordinal),
-                        ImGuiSelectableFlags.None,
-                        new Vector2(rowWidth, rowHeight)))
+                bool selected = string.Equals(_selectedReplayPath, entry.Path, StringComparison.Ordinal);
+                Vector2 rowMin = ImGui.GetCursorScreenPos();
+                Vector2 rowMax = rowMin + new Vector2(rowWidth, rowHeight);
+                ImDrawListPtr drawList = ImGui.GetWindowDrawList();
+                uint rowColor = ImGui.ColorConvertFloat4ToU32(selected
+                    ? new Vector4(0.24f, 0.12f, 0.20f, 1f)
+                    : new Vector4(0.12f, 0.085f, 0.13f, 1f));
+                uint rowBorder = ImGui.ColorConvertFloat4ToU32(selected
+                    ? new Vector4(0.98f, 0.43f, 0.52f, 0.9f)
+                    : new Vector4(0.26f, 0.18f, 0.27f, 1f));
+                drawList.AddRectFilled(rowMin, rowMax, rowColor, 7f);
+                drawList.AddRect(rowMin, rowMax, rowBorder, 7f, 0, selected ? 1.5f : 1f);
+
+                ImGui.PushStyleColor(ImGuiCol.Header, new Vector4(0f, 0f, 0f, 0f));
+                ImGui.PushStyleColor(ImGuiCol.HeaderHovered, new Vector4(1f, 1f, 1f, 0.03f));
+                ImGui.PushStyleColor(ImGuiCol.HeaderActive, new Vector4(1f, 1f, 1f, 0.05f));
+                bool clicked = ImGui.Selectable(
+                    $"##replay-row-{entry.Path}",
+                    selected,
+                    ImGuiSelectableFlags.None,
+                    new Vector2(rowWidth, rowHeight));
+                ImGui.PopStyleColor(3);
+
+                string title = EllipsizeManagerText(
+                    GetReplayDisplayTitle(entry),
+                    Math.Max(100f, rowWidth - 180f));
+                string metadata = $"{entry.RecordedAtUtc.ToLocalTime():MM-dd HH:mm}  {entry.HitCount} {ui.Inputs}";
+                Vector4 statusVector = !entry.Supported
+                    ? new Vector4(1f, 0.45f, 0.42f, 1f)
+                    : entry.Completed
+                        ? new Vector4(0.42f, 1f, 0.65f, 1f)
+                        : new Vector4(1f, 0.78f, 0.32f, 1f);
+                uint statusColor = ImGui.ColorConvertFloat4ToU32(statusVector);
+                Vector2 textStart = rowMin + new Vector2(16f, 11f);
+                drawList.AddText(ImGui.GetFont(), ImGui.GetFontSize() * 1.05f, textStart, 0xFFFFFFFF, title);
+                drawList.AddText(
+                    ImGui.GetFont(),
+                    ImGui.GetFontSize() * 0.86f,
+                    textStart + new Vector2(0f, 27f),
+                    ImGui.ColorConvertFloat4ToU32(new Vector4(0.68f, 0.60f, 0.66f, 1f)),
+                    SanitizeImGuiText(metadata));
+                drawList.AddText(
+                    ImGui.GetFont(),
+                    ImGui.GetFontSize() * 0.86f,
+                    new Vector2(rowMax.X - 122f, textStart.Y),
+                    statusColor,
+                    SanitizeImGuiText(result));
+                drawList.AddText(
+                    ImGui.GetFont(),
+                    ImGui.GetFontSize() * 0.86f,
+                    new Vector2(rowMax.X - 122f, textStart.Y + 27f),
+                    ImGui.ColorConvertFloat4ToU32(new Vector4(0.82f, 0.76f, 0.80f, 1f)),
+                    $"{progress}%");
+                float progressWidth = Math.Max(1f, rowWidth - 32f);
+                Vector2 progressMin = new(rowMin.X + 16f, rowMax.Y - 10f);
+                Vector2 progressMax = new(rowMin.X + 16f + progressWidth * progress / 100f, rowMax.Y - 6f);
+                drawList.AddRectFilled(
+                    new Vector2(rowMin.X + 16f, rowMax.Y - 10f),
+                    new Vector2(rowMax.X - 16f, rowMax.Y - 6f),
+                    ImGui.ColorConvertFloat4ToU32(new Vector4(0.24f, 0.18f, 0.24f, 1f)),
+                    2f);
+                if (progress > 0)
+                    drawList.AddRectFilled(progressMin, progressMax, statusColor, 2f);
+
+                if (!clicked)
                     continue;
 
                 _selectedReplayPath = entry.Path;
@@ -2482,6 +3098,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
                 _deletePopupRequested = false;
                 _editingReplayPath = entry.Path;
                 _replayTitleEdit = entry.Title;
+                _managerTitleEditing = false;
                 _managerShowingDetails = true;
             }
         }
@@ -2495,15 +3112,16 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
         float buttonWidth = Math.Max(
             1f,
             (ImGui.GetContentRegionAvail().X - style.ItemSpacing.X) * 0.5f);
-        if (ImGui.Button(ui.BackToList, new Vector2(buttonWidth, buttonHeight)))
+        if (DrawIconButton("back", "##details-back", new Vector2(buttonWidth, buttonHeight)))
         {
             _managerShowingDetails = false;
             _pendingDeletePath = "";
             _deletePopupRequested = false;
+            _managerTitleEditing = false;
             StopManagerPreview();
         }
         ImGui.SameLine();
-        if (ImGui.Button(ui.Close, new Vector2(buttonWidth, buttonHeight)))
+        if (DrawIconButton("close", "##details-close", new Vector2(buttonWidth, buttonHeight)))
             open = false;
 
         ShowNotice();
@@ -2529,48 +3147,57 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             if (available.X < 860f)
             {
                 DrawReplayDetailsInfo(ui, selected);
-                ImGui.Separator();
+                ImGui.Spacing();
                 DrawReplayChartPreview(ui, selected);
+                ImGui.Spacing();
+                DrawReplayProgressCard(ui, selected);
             }
             else
             {
                 ImGuiStylePtr style = ImGui.GetStyle();
                 float spacing = style.ItemSpacing.X;
-                float coverWidth = Math.Min(420f, Math.Max(280f, available.X * 0.34f));
+                float coverWidth = Math.Min(440f, Math.Max(300f, available.X * 0.34f));
                 float infoWidth = Math.Max(1f, available.X - coverWidth - spacing);
                 Vector2 rowStart = ImGui.GetCursorScreenPos();
 
                 ImGui.BeginGroup();
-                ImGui.PushTextWrapPos(rowStart.X + infoWidth);
                 DrawReplayDetailsInfo(ui, selected, infoWidth);
-                ImGui.PopTextWrapPos();
-                ImGui.EndGroup();
                 Vector2 infoBottom = ImGui.GetItemRectMax();
+                ImGui.EndGroup();
 
-                ImGui.SetCursorScreenPos(new Vector2(
-                    rowStart.X + infoWidth + spacing,
-                    rowStart.Y));
+                ImGui.SetCursorScreenPos(new Vector2(rowStart.X + infoWidth + spacing, rowStart.Y));
                 ImGui.BeginGroup();
-                DrawReplayChartPreview(ui, selected);
+                DrawReplayChartPreview(ui, selected, 320f, Math.Max(0f, infoBottom.Y - rowStart.Y));
                 ImGui.EndGroup();
                 Vector2 coverBottom = ImGui.GetItemRectMax();
 
-                // Anchor the full-width action area after the taller of the
-                // summary and cover. The shared spacer below adds the visual gap.
-                ImGui.SetCursorScreenPos(new Vector2(
-                    rowStart.X,
-                    Math.Max(infoBottom.Y, coverBottom.Y)));
+                ImGui.SetCursorScreenPos(new Vector2(rowStart.X, Math.Max(infoBottom.Y, coverBottom.Y)));
+                ImGui.Spacing();
+                DrawReplayProgressCard(ui, selected, available.X);
             }
         }
 
-        // Keep the action section visibly separated from whichever column is
-        // taller. The row is already anchored to max(summaryBottom,
-        // coverBottom) above; this explicit gap prevents the separator and
-        // buttons from touching the last line of either column.
         float actionGap = Math.Max(18f, ImGui.GetStyle().ItemSpacing.Y * 2.5f);
         ImGui.Dummy(new Vector2(1f, actionGap));
         ImGui.Separator();
         DrawReplayDetailsActions(ui, selected);
+    }
+
+    private void DrawReplayProgressCard(UiText ui, ReplayFileEntry selected, float width = -1f)
+    {
+        float cardWidth = width > 0f ? width : ImGui.GetContentRegionAvail().X;
+        ImGui.BeginChild("##ReplayProgressCard", new Vector2(cardWidth, 0f),
+            ImGuiChildFlags.Borders | ImGuiChildFlags.AutoResizeY,
+            ImGuiWindowFlags.NoScrollbar | ImGuiWindowFlags.NoScrollWithMouse);
+        int startProgress = GetProgress(selected.StartTile, selected.TotalTiles);
+        int endProgress = GetEndProgress(selected);
+        Vector4 progressColor = selected.Completed
+            ? new Vector4(0.35f, 1f, 0.66f, 1f)
+            : new Vector4(1f, 0.72f, 0.35f, 1f);
+        ImGui.TextColored(progressColor, $"{ui.Progress}  {startProgress}%  →  {endProgress}%");
+        ImGui.ProgressBar(endProgress / 100f, new Vector2(-1f, 16f), $"{endProgress}%");
+        DrawManagerMetric(ui.LevelPath, string.IsNullOrWhiteSpace(selected.LevelPath) ? "-" : selected.LevelPath);
+        ImGui.EndChild();
     }
 
     private void DrawReplayDetailsInfo(
@@ -2578,26 +3205,103 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
         ReplayFileEntry selected,
         float progressWidth = -1f)
     {
-        DrawManagerSectionTitle(ui.Details);
-        ImGui.TextWrapped(GetReplayDisplayTitle(selected));
+        float width = progressWidth > 0f ? progressWidth : ImGui.GetContentRegionAvail().X;
+        string result = selected.Supported
+            ? selected.Completed ? ui.Complete : ui.Failed
+            : ui.Unsupported;
+        Vector4 resultColor = selected.Supported
+            ? selected.Completed ? new Vector4(0.35f, 1f, 0.66f, 1f) : new Vector4(1f, 0.72f, 0.35f, 1f)
+            : new Vector4(1f, 0.42f, 0.45f, 1f);
+
+        if (selected.Supported && !string.Equals(_editingReplayPath, selected.Path, StringComparison.Ordinal))
+        {
+            _editingReplayPath = selected.Path;
+            _replayTitleEdit = selected.Title;
+            _managerTitleEditing = false;
+        }
+
+        ImGui.BeginChild("##ReplayDetailHero", new Vector2(width, 0f), ImGuiChildFlags.Borders | ImGuiChildFlags.AutoResizeY);
+        ImGui.TextColored(resultColor, result.ToUpperInvariant());
+        ImGui.SameLine(0f, 12f);
+        ImGui.TextUnformatted(GetReplayDisplayTitle(selected));
         if (!string.IsNullOrWhiteSpace(selected.Title))
-            DrawManagerMutedWrapped($"{ui.OriginalSong}: {CleanManagerText(selected.SongName)}");
-        if (!string.IsNullOrWhiteSpace(selected.ArtistName))
-            DrawManagerMutedWrapped($"{ui.Artist}: {CleanManagerText(selected.ArtistName)}");
-        ImGui.TextDisabled($"{ui.RecordedAt}: {selected.RecordedAtUtc.ToLocalTime():yyyy-MM-dd HH:mm:ss}");
-        int startProgress = GetProgress(selected.StartTile, selected.TotalTiles);
-        int endProgress = GetEndProgress(selected);
-        ImGui.TextDisabled($"{ui.Progress}: {startProgress}% - {endProgress}%");
-        ImGui.ProgressBar(
-            endProgress / 100f,
-            new Vector2(progressWidth > 0f ? progressWidth : -1f, 0f),
-            $"{endProgress}%");
-        ImGui.TextDisabled($"{ui.Inputs}: {selected.HitCount}");
-        ImGui.TextDisabled($"{ui.Speed}: {selected.Speed:0.00}x");
-        ImGui.TextDisabled($"{ui.Source}: {(selected.IsOfficialLevel ? ui.Official : ui.Custom)}");
+        {
+            ImGui.TextDisabled($"{ui.OriginalSong}: {CleanManagerText(selected.SongName)}");
+            if (!string.IsNullOrWhiteSpace(selected.ArtistName))
+                ImGui.TextDisabled($"{ui.Artist}: {CleanManagerText(selected.ArtistName)}");
+        }
+        if (selected.Supported && !_managerTitleEditing)
+        {
+            ImGui.SameLine();
+            if (ImGui.SmallButton("编辑标题##detail-edit"))
+            {
+                _managerTitleEditing = true;
+                _replayTitleEdit = selected.Title;
+            }
+        }
+        if (selected.Supported && _managerTitleEditing)
+        {
+            ImGui.SetNextItemWidth(Math.Max(1f, width - 20f));
+            ImGui.InputText("##replay-title-edit", ref _replayTitleEdit, 128);
+            bool changed = !string.Equals(_replayTitleEdit.Trim(), selected.Title, StringComparison.Ordinal);
+            ImGui.BeginDisabled(!changed);
+            if (ImGui.Button(ui.SaveTitle, new Vector2(130f, GetManagerButtonHeight())))
+                SaveReplayTitle(selected, ui);
+            ImGui.EndDisabled();
+            ImGui.SameLine();
+            if (ImGui.Button(ui.Cancel, new Vector2(130f, GetManagerButtonHeight())))
+            {
+                _managerTitleEditing = false;
+                _replayTitleEdit = selected.Title;
+            }
+        }
+        ImGui.EndChild();
+
+        ImGui.Spacing();
+        ImGui.BeginChild("##ReplayDetailMetrics", new Vector2(width, 0f), ImGuiChildFlags.Borders | ImGuiChildFlags.AutoResizeY);
+        float half = Math.Max(1f, (width - ImGui.GetStyle().ItemSpacing.X) * 0.5f);
+        ImGui.BeginGroup();
+        DrawManagerMetric(ui.RecordedAt, selected.RecordedAtUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss"));
+        DrawManagerMetric(ui.Inputs, selected.HitCount.ToString());
+        ImGui.EndGroup();
+        ImGui.SameLine(half + ImGui.GetStyle().ItemSpacing.X);
+        ImGui.BeginGroup();
+        DrawManagerMetric(ui.Speed, $"{selected.Speed:0.00}x");
+        DrawManagerMetric("判定难度", GetDifficultyLabel(selected.Difficulty));
+        DrawManagerMetric(ui.Source, selected.IsOfficialLevel ? ui.Official : ui.Custom);
+        ImGui.EndGroup();
+        ImGui.EndChild();
+    }
+
+    private static void DrawManagerMetric(string label, string value)
+    {
+        ImGui.TextDisabled(label.ToUpperInvariant());
         DrawManagerMutedWrapped(
-            $"{ui.LevelPath}: "
-            + (string.IsNullOrWhiteSpace(selected.LevelPath) ? "—" : selected.LevelPath));
+            string.IsNullOrWhiteSpace(value) ? "-" : value);
+    }
+
+    private static bool DrawManagerEditIconButton(string id, float size)
+    {
+        Vector2 min = ImGui.GetCursorScreenPos();
+        bool clicked = ImGui.InvisibleButton(id, new Vector2(size, size));
+        bool hovered = ImGui.IsItemHovered();
+        Vector2 max = min + new Vector2(size, size);
+        ImDrawListPtr drawList = ImGui.GetWindowDrawList();
+        uint background = ImGui.ColorConvertFloat4ToU32(hovered
+            ? new Vector4(0.98f, 0.43f, 0.52f, 1f)
+            : new Vector4(0.22f, 0.13f, 0.18f, 1f));
+        uint foreground = ImGui.ColorConvertFloat4ToU32(
+            new Vector4(1f, 0.90f, 0.94f, 1f));
+        drawList.AddRectFilled(min, max, background, 6f);
+        Vector2 start = min + new Vector2(size * 0.30f, size * 0.68f);
+        Vector2 end = min + new Vector2(size * 0.70f, size * 0.28f);
+        drawList.AddLine(start, end, foreground, 2.5f);
+        drawList.AddTriangleFilled(
+            end,
+            end + new Vector2(size * 0.14f, -size * 0.03f),
+            end + new Vector2(size * 0.04f, size * 0.14f),
+            foreground);
+        return clicked;
     }
 
     private void DrawReplayDetailsActions(UiText ui, ReplayFileEntry selected)
@@ -2605,32 +3309,9 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
         if (!selected.Supported)
         {
             StopManagerPreview();
-            ImGui.TextWrapped(selected.Error ?? ui.Unsupported);
+            ImGui.TextWrapped(SanitizeImGuiText(selected.Error ?? ui.Unsupported));
         }
-        else
-        {
-            if (!string.Equals(_editingReplayPath, selected.Path, StringComparison.Ordinal))
-            {
-                _editingReplayPath = selected.Path;
-                _replayTitleEdit = selected.Title;
-            }
-
-            DrawManagerSectionTitle(ui.ReplayTitle);
-            ImGui.SetNextItemWidth(-1f);
-            ImGui.InputText("##replay-title-edit", ref _replayTitleEdit, 128);
-            bool titleChanged = !string.Equals(
-                _replayTitleEdit.Trim(),
-                selected.Title,
-                StringComparison.Ordinal);
-            ImGui.BeginDisabled(!titleChanged);
-            if (ImGui.Button(
-                    ui.SaveTitle + "##manager-save-title",
-                    new Vector2(-1f, GetManagerButtonHeight())))
-                SaveReplayTitle(selected, ui);
-            ImGui.EndDisabled();
-        }
-
-        float actionButtonHeight = GetManagerButtonHeight();
+        float actionButtonHeight = Math.Max(42f, ImGui.GetFrameHeight() * 1.05f);
         ImGuiStylePtr style = ImGui.GetStyle();
         float actionButtonWidth = selected.Supported
             ? Math.Max(1f, (ImGui.GetContentRegionAvail().X - style.ItemSpacing.X) * 0.5f)
@@ -2677,25 +3358,70 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
     private void DrawReplayChartPreview(
         UiText ui,
         ReplayFileEntry selected,
-        float maxDisplayHeight = 320f)
+        float maxDisplayHeight = 320f,
+        float minCardHeight = 0f)
     {
         EnsureManagerPreview(selected);
-        DrawManagerSectionTitle(ui.ChartPreview);
+        float cardWidth = Math.Max(180f, ImGui.GetContentRegionAvail().X);
         ReplayChartPreview? preview = _replayChartPreview;
-        if (preview == null
-            || !preview.TryGetTexture(out nint textureId, out int width, out int height))
-        {
-            ImGui.TextDisabled(ui.PreviewUnavailable);
-            return;
-        }
+        nint textureId = 0;
+        int textureWidth = 0;
+        int textureHeight = 0;
+        bool hasCover = preview != null
+            && preview.TryGetTexture(out textureId, out textureWidth, out textureHeight);
 
-        Vector2 available = ImGui.GetContentRegionAvail();
-        float diameter = Math.Max(
-            1f,
-            Math.Min(Math.Max(available.X, 1f), Math.Max(1f, maxDisplayHeight)));
-        Vector2 min = ImGui.GetCursorScreenPos();
-        ImGui.Dummy(new Vector2(diameter, diameter));
-        DrawRotatingReplayCover(textureId, width, height, min, diameter);
+        float availableWidth = Math.Max(1f, cardWidth - ImGui.GetStyle().WindowPadding.X * 2f);
+        float diameter = Math.Min(Math.Min(availableWidth - 24f, maxDisplayHeight), 280f);
+        diameter = Math.Max(148f, diameter);
+        float panelHeight = diameter + 12f;
+        float cardHeight = Math.Max(panelHeight + 54f, minCardHeight);
+        panelHeight = Math.Max(panelHeight, cardHeight - 54f);
+
+        ImGui.BeginChild(
+            "##ReplayCoverCard",
+            new Vector2(cardWidth, cardHeight),
+            ImGuiChildFlags.Borders,
+            ImGuiWindowFlags.NoScrollbar | ImGuiWindowFlags.NoScrollWithMouse);
+        ImGui.TextColored(new Vector4(0.98f, 0.43f, 0.52f, 1f), "谱面封面");
+        ImGui.SameLine();
+        ImGui.TextDisabled(selected.IsOfficialLevel ? ui.Official : ui.Custom);
+        ImGui.Separator();
+
+        Vector2 areaMin = ImGui.GetCursorScreenPos();
+        Vector2 areaSize = new(availableWidth, panelHeight);
+        ImDrawListPtr draw = ImGui.GetWindowDrawList();
+        draw.AddRectFilled(
+            areaMin,
+            areaMin + areaSize,
+            ImGui.ColorConvertFloat4ToU32(new Vector4(0.075f, 0.055f, 0.085f, 1f)),
+            8f);
+
+        if (hasCover)
+        {
+            Vector2 min = areaMin + new Vector2(
+                (availableWidth - diameter) * 0.5f,
+                (panelHeight - diameter) * 0.5f);
+            ImGui.Dummy(areaSize);
+            DrawRotatingReplayCover(textureId, textureWidth, textureHeight, min, diameter);
+        }
+        else
+        {
+            DrawCoverPlaceholder(draw, areaMin, areaSize);
+            ImGui.Dummy(areaSize);
+        }
+        ImGui.EndChild();
+    }
+
+    private static void DrawCoverPlaceholder(ImDrawListPtr draw, Vector2 min, Vector2 size)
+    {
+        Vector2 center = min + size * 0.5f;
+        float radius = Math.Min(size.X, size.Y) * 0.18f;
+        uint color = ImGui.ColorConvertFloat4ToU32(new Vector4(0.74f, 0.48f, 0.62f, 1f));
+        uint muted = ImGui.ColorConvertFloat4ToU32(new Vector4(0.48f, 0.35f, 0.46f, 1f));
+        draw.AddCircle(center, radius, color, 32, 2.5f);
+        draw.AddCircleFilled(center, radius * 0.18f, color, 16);
+        draw.AddLine(center + new Vector2(0, -radius * 0.75f), center + new Vector2(0, radius * 0.75f), muted, 2f);
+        draw.AddLine(center + new Vector2(-radius * 0.75f, 0), center + new Vector2(radius * 0.75f, 0), muted, 2f);
     }
 
     private static void DrawRotatingReplayCover(
@@ -2775,13 +3501,13 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
     private static void DrawManagerSectionTitle(string text)
     {
         ImGui.Spacing();
-        ImGui.TextColored(new Vector4(0.45f, 0.78f, 0.96f, 1f), text);
+        ImGui.TextColored(new Vector4(0.98f, 0.43f, 0.52f, 1f), text);
     }
 
     private static void DrawManagerMutedWrapped(string text)
     {
-        ImGui.PushStyleColor(ImGuiCol.Text, ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled]);
-        ImGui.TextWrapped(text);
+        ImGui.PushStyleColor(ImGuiCol.Text, new Vector4(0.86f, 0.80f, 0.86f, 1f));
+        ImGui.TextWrapped(SanitizeImGuiText(text));
         ImGui.PopStyleColor();
     }
 
@@ -2823,7 +3549,34 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             pendingSpace = false;
             builder.Append(character);
         }
-        return builder.ToString().TrimEnd();
+        return SanitizeImGuiText(builder.ToString().TrimEnd());
+    }
+
+    private static string SanitizeImGuiText(string? value)
+    {
+        if (string.IsNullOrEmpty(value))
+            return "";
+
+        StringBuilder builder = new(value.Length);
+        for (int index = 0; index < value.Length; index++)
+        {
+            char character = value[index];
+            if (char.IsHighSurrogate(character))
+            {
+                if (index + 1 < value.Length && char.IsLowSurrogate(value[index + 1]))
+                    index++;
+                builder.Append('*');
+            }
+            else if (char.IsLowSurrogate(character))
+            {
+                builder.Append('*');
+            }
+            else
+            {
+                builder.Append(character);
+            }
+        }
+        return builder.ToString();
     }
 
     private static string EllipsizeManagerText(string text, float maximumWidth)
@@ -2871,6 +3624,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             string title = RequireStore().UpdateTitle(selected.Path, _replayTitleEdit);
             _editingReplayPath = selected.Path;
             _replayTitleEdit = title;
+            _managerTitleEditing = false;
             SetNotice(ui.TitleSaved);
             SetToast(ui.TitleSaved);
             RefreshFiles();
@@ -2891,6 +3645,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             _pendingDeletePath = "";
             _editingReplayPath = "";
             _replayTitleEdit = "";
+            _managerTitleEditing = false;
             _managerShowingDetails = false;
             RefreshFiles();
         }
@@ -2988,6 +3743,47 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
         return $"{prefix}  {progress}{song}";
     }
 
+    private static bool DrawIconButton(string icon, string id, Vector2 size)
+    {
+        Vector2 min = ImGui.GetCursorScreenPos();
+        bool clicked = ImGui.InvisibleButton(id, size);
+        bool hovered = ImGui.IsItemHovered();
+        ImDrawListPtr draw = ImGui.GetWindowDrawList();
+        Vector4 fill = hovered ? new Vector4(0.38f, 0.17f, 0.27f, 1f) : new Vector4(0.18f, 0.12f, 0.18f, 1f);
+        draw.AddRectFilled(min, min + size, ImGui.ColorConvertFloat4ToU32(fill), 7f);
+        Vector2 center = min + size * 0.5f;
+        uint ink = ImGui.ColorConvertFloat4ToU32(new Vector4(1f, 0.88f, 0.93f, 1f));
+        float r = Math.Min(size.X, size.Y) * 0.24f;
+        switch (icon)
+        {
+            case "close":
+                draw.AddLine(center + new Vector2(-r, -r), center + new Vector2(r, r), ink, Math.Max(2.5f, Math.Min(size.X, size.Y) * 0.055f));
+                draw.AddLine(center + new Vector2(r, -r), center + new Vector2(-r, r), ink, Math.Max(2.5f, Math.Min(size.X, size.Y) * 0.055f));
+                break;
+            case "back":
+                draw.AddLine(center + new Vector2(r, 0), center + new Vector2(-r, 0), ink, Math.Max(2.5f, Math.Min(size.X, size.Y) * 0.055f));
+                draw.AddLine(center + new Vector2(-r, 0), center + new Vector2(-r * 0.15f, -r * 0.85f), ink, Math.Max(2.5f, Math.Min(size.X, size.Y) * 0.055f));
+                draw.AddLine(center + new Vector2(-r, 0), center + new Vector2(-r * 0.15f, r * 0.85f), ink, Math.Max(2.5f, Math.Min(size.X, size.Y) * 0.055f));
+                break;
+            case "refresh":
+                draw.AddCircle(center, r, ink, 20, 2.5f);
+                draw.AddTriangleFilled(center + new Vector2(r, -r * 0.9f), center + new Vector2(r * 0.25f, -r * 1.15f), center + new Vector2(r * 0.65f, -r * 0.35f), ink);
+                break;
+        }
+        return clicked;
+    }
+
+    private static void DrawNoticeIcon(ImDrawListPtr draw, Vector2 position)
+    {
+        float size = Math.Max(18f, ImGui.GetTextLineHeight() * 0.9f);
+        Vector2 center = position + new Vector2(size * 0.5f, size * 0.5f);
+        uint color = ImGui.ColorConvertFloat4ToU32(new Vector4(0.98f, 0.43f, 0.52f, 1f));
+        draw.AddCircle(center, size * 0.38f, color, 20, 2f);
+        draw.AddLine(center + new Vector2(0, -size * 0.18f), center + new Vector2(0, size * 0.10f), color, 2f);
+        draw.AddCircleFilled(center + new Vector2(0, size * 0.23f), 1.5f, color);
+        ImGui.Dummy(new Vector2(size, size));
+    }
+
     private void ShowNotice()
     {
         string notice;
@@ -2998,7 +3794,18 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             until = _noticeUntilUtc;
         }
         if (!string.IsNullOrEmpty(notice) && DateTime.UtcNow < until)
-            ImGui.TextWrapped(notice);
+        {
+            ImGui.PushStyleColor(ImGuiCol.ChildBg, new Vector4(0.08f, 0.18f, 0.18f, 1f));
+            ImGui.PushStyleColor(ImGuiCol.Text, new Vector4(0.62f, 0.96f, 0.90f, 1f));
+            ImGui.PushStyleVar(ImGuiStyleVar.ChildRounding, 6f);
+            if (ImGui.BeginChild("##ReplayNotice", new Vector2(-1f, 0f), ImGuiChildFlags.AutoResizeY))
+                DrawNoticeIcon(ImGui.GetWindowDrawList(), ImGui.GetCursorScreenPos());
+                ImGui.SameLine(0f, 10f);
+                ImGui.TextWrapped(SanitizeImGuiText(notice));
+            ImGui.EndChild();
+            ImGui.PopStyleVar();
+            ImGui.PopStyleColor(2);
+        }
     }
 
     private void SetNotice(string message)
@@ -3239,6 +4046,9 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             _resultAttempt = CloneReplay(replay);
             _resultAttemptSaved = saved;
             _resultSaveQueued = false;
+            _resultSaveButtonUntilUtc = saved
+                ? DateTime.UtcNow.AddSeconds(5)
+                : default;
         }
     }
 
@@ -3247,6 +4057,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
         _resultAttempt = null;
         _resultAttemptSaved = false;
         _resultSaveQueued = false;
+        _resultSaveButtonUntilUtc = default;
     }
 
     private static bool IsEditorReplay(ReplayData? replay)
@@ -3283,6 +4094,7 @@ public sealed class ReplayPlugin : IModPlugin, IModSettings
             Completed = source.Completed,
             Speed = source.Speed,
             Bpm = source.Bpm,
+            Difficulty = source.Difficulty,
             StartTile = source.StartTile,
             EndTile = source.EndTile,
             TotalTiles = source.TotalTiles,

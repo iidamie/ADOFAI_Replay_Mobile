@@ -30,6 +30,7 @@ internal sealed class GameApi
     private readonly IRuntimeClass? _levelSelectClass;
     private readonly IRuntimeClass? _customLevelSelectClass;
     private readonly IRuntimeClass? _gcsClass;
+    private readonly IRuntimeClass? _uiControllerClass;
     private readonly IRuntimeClass? _rdStringClass;
 
     private readonly IRuntimeField? _controllerInstance;
@@ -101,6 +102,7 @@ internal sealed class GameApi
     private readonly IRuntimeField? _speedTrialMode;
     private readonly IRuntimeField? _currentSpeedTrial;
     private readonly IRuntimeField? _nextSpeedRun;
+    private readonly IRuntimeField? _gcsDifficulty;
     private readonly IRuntimeField? _lofiVersion;
     private readonly IRuntimeField? _language;
     private readonly IRuntimeField? _textValue;
@@ -120,6 +122,9 @@ internal sealed class GameApi
     private readonly IRuntimeMethod? _getLevelSelect;
     private readonly IRuntimeMethod? _getLevelSelectBase;
     private readonly IRuntimeMethod? _getCustomLevelSelect;
+    private readonly IRuntimeMethod? _getUiControllerInstance;
+    private readonly IRuntimeMethod? _showDifficultyContainer;
+    private readonly IRuntimeMethod? _minimizeDifficultyContainer;
     private readonly IRuntimeMethod? _getLevelMaker;
     private readonly IRuntimeMethod? _getPercentComplete;
     private readonly IRuntimeMethod? _getPlayerAuto;
@@ -223,6 +228,7 @@ internal sealed class GameApi
         _levelSelectClass = FindClass("", "scnLevelSelect");
         _customLevelSelectClass = FindClass("", "scnCLS");
         _gcsClass = FindClass("", "GCS");
+        _uiControllerClass = FindClass("", "scrUIController");
         _rdStringClass = FindClass("", "RDString");
 
         _controllerInstance = FindField(_controllerClass, "_instance", "instance");
@@ -295,6 +301,7 @@ internal sealed class GameApi
         _speedTrialMode = FindField(_gcsClass, "speedTrialMode");
         _currentSpeedTrial = FindField(_gcsClass, "currentSpeedTrial");
         _nextSpeedRun = FindField(_gcsClass, "nextSpeedRun");
+        _gcsDifficulty = FindField(_gcsClass, "difficulty");
         _lofiVersion = FindField(_gcsClass, "lofiVersion");
         _language = FindField(_rdStringClass, "language");
 
@@ -313,6 +320,9 @@ internal sealed class GameApi
         _getLevelSelect = _adoBaseClass?.GetMethod("get_levelSelect", 0);
         _getLevelSelectBase = _adoBaseClass?.GetMethod("get_levelSelectBase", 0);
         _getCustomLevelSelect = _adoBaseClass?.GetMethod("get_cls", 0);
+        _getUiControllerInstance = _uiControllerClass?.GetMethod("get_instance", 0);
+        _showDifficultyContainer = _uiControllerClass?.GetMethod("ShowDifficultyContainer", 1);
+        _minimizeDifficultyContainer = _uiControllerClass?.GetMethod("MinimizeDifficultyContainer", 0);
         _getLevelMaker = _adoBaseClass?.GetMethod("get_lm", 0)
             ?? _levelMakerClass?.GetMethod("get_instance", 0);
         _getPercentComplete = _controllerClass.GetMethod("get_percentComplete", 0);
@@ -597,6 +607,11 @@ internal sealed class GameApi
     internal bool IsLevelSelect()
     {
         nint controller = GetController();
+        // The level-select singleton remains alive after entering scnGame on
+        // both supported mobile versions. gameworld must win over that singleton.
+        if (IsGameWorld(controller))
+            return false;
+
         string sceneName = InvokeStaticString(_getSceneName);
         if (string.IsNullOrWhiteSpace(sceneName))
             sceneName = ReadString(_sceneToLoad, 0);
@@ -618,9 +633,6 @@ internal sealed class GameApi
         // stale controller flag can hide the main-page entry.
         if (InvokeStaticObject(_getLevelSelectInstance) != 0)
             return true;
-
-        if (IsGameWorld(controller))
-            return false;
 
         try
         {
@@ -1021,6 +1033,77 @@ internal sealed class GameApi
     internal int GetCheckpoint()
     {
         return Read(_checkpoint, 0, 0);
+    }
+
+    /// <summary>
+    /// Reads the game's global difficulty enum without referencing the game
+    /// assembly's Difficulty type. Both supported game versions use the same
+    /// underlying values: Lenient = 0, Normal = 1, Strict = 2.
+    /// </summary>
+    internal int GetDifficulty()
+    {
+        return Math.Clamp(Read(_gcsDifficulty, 0, 1), 0, 2);
+    }
+
+    /// <summary>
+    /// Writes the game's global difficulty enum. The field is static in both
+    /// 3.1.2 and 3.3.1, so the zero instance is intentional here.
+    /// </summary>
+    internal void SetDifficulty(int difficulty)
+    {
+        Write(_gcsDifficulty, 0, Math.Clamp(difficulty, 0, 2));
+    }
+
+    /// <summary>
+    /// Runs the game's native minimize animation. On the supported mobile
+    /// builds this is the compact post-start difficulty state: the arrow
+    /// buttons are removed and only the difficulty status remains visible.
+    /// </summary>
+    internal bool MinimizeReplayDifficultySelector()
+    {
+        if (_getUiControllerInstance == null || _minimizeDifficultyContainer == null)
+            return false;
+        try
+        {
+            nint uiController = _getUiControllerInstance.InvokeStatic();
+            if (uiController == 0)
+                return false;
+            _minimizeDifficultyContainer.Invoke(uiController);
+            return true;
+        }
+        catch (Exception exception)
+        {
+            Logger.Debug("Replay", $"隐藏原生难度控件失败: {exception.Message}");
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Initializes the game's native difficulty UI and immediately lets the
+    /// game collapse it to its compact status-only state. This avoids showing
+    /// the full left/right selector as an ImGui replacement during a replay.
+    /// </summary>
+    internal unsafe bool ShowReplayDifficultyCompact()
+    {
+        if (_getUiControllerInstance == null
+            || _showDifficultyContainer == null
+            || _minimizeDifficultyContainer == null)
+            return false;
+        try
+        {
+            nint uiController = _getUiControllerInstance.InvokeStatic();
+            if (uiController == 0)
+                return false;
+            int mode = 3;
+            _showDifficultyContainer.Invoke(uiController, new[] { (nint)(&mode) });
+            _minimizeDifficultyContainer.Invoke(uiController);
+            return true;
+        }
+        catch (Exception exception)
+        {
+            Logger.Debug("Replay", $"显示原生缩小难度控件失败: {exception.Message}");
+            return false;
+        }
     }
 
     /// <summary>
@@ -1576,6 +1659,7 @@ internal sealed class GameApi
         Write(_checkpoint, 0, replay.StartTile);
         Write(_currentSpeedTrial, 0, speed);
         Write(_nextSpeedRun, 0, speed);
+        SetDifficulty(replay.Difficulty);
     }
 
     private void ResetLevelDestination()

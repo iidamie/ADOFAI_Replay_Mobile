@@ -37,6 +37,7 @@ internal sealed class GitHubUpdateService : IDisposable
     private UpdateState _state;
     private string _status = "";
     private ReleaseInfo? _release;
+    private ReleaseInfo? _latestRelease;
     private string _notification = "";
     private DateTime _notificationUntilUtc;
     private bool _disposed;
@@ -58,6 +59,22 @@ internal sealed class GitHubUpdateService : IDisposable
     internal void StartAutomaticCheck() => StartCheck();
 
     internal void CheckNow() => StartCheck();
+
+    internal ReplayUpdateSnapshot GetManagerSnapshot()
+    {
+        lock (_stateLock)
+        {
+            return new ReplayUpdateSnapshot(
+                _state is UpdateState.Checking,
+                _state is UpdateState.Downloading,
+                _state is UpdateState.Available,
+                _state is UpdateState.ReadyToRestart,
+                _state is UpdateState.Failed,
+                _status,
+                _latestRelease?.Version ?? _currentVersion,
+                _latestRelease?.Notes ?? "");
+        }
+    }
 
     internal void DownloadUpdate()
     {
@@ -178,6 +195,7 @@ internal sealed class GitHubUpdateService : IDisposable
             _state = UpdateState.Checking;
             _status = "Checking GitHub releases...";
             _release = null;
+            _latestRelease = null;
             _notification = "";
             _notificationUntilUtc = default;
         }
@@ -202,10 +220,16 @@ internal sealed class GitHubUpdateService : IDisposable
 
             ReleaseInfo release = ParseLatestMobileRelease(document.RootElement);
             bool updateAvailable = CompareVersions(release.Version, _currentVersion) > 0;
+            ReleaseInfo? currentRelease = FindReleaseForVersion(
+                document.RootElement,
+                _currentVersion);
             lock (_stateLock)
             {
                 if (_disposed)
                     return;
+                _latestRelease = updateAvailable
+                    ? release
+                    : currentRelease ?? release;
                 _release = updateAvailable ? release : null;
                 _state = updateAvailable ? UpdateState.Available : UpdateState.UpToDate;
                 _status = updateAvailable
@@ -325,6 +349,20 @@ internal sealed class GitHubUpdateService : IDisposable
             "GitHub releases do not contain a Replay package");
     }
 
+    private static ReleaseInfo? FindReleaseForVersion(JsonElement root, string version)
+    {
+        if (root.ValueKind != JsonValueKind.Array)
+            return null;
+
+        foreach (JsonElement release in root.EnumerateArray())
+        {
+            ReleaseInfo? candidate = TryParseMobileRelease(release);
+            if (candidate != null && CompareVersions(candidate.Version, version) == 0)
+                return candidate;
+        }
+        return null;
+    }
+
     private static ReleaseInfo? TryParseMobileRelease(JsonElement root)
     {
         if (root.TryGetProperty("draft", out JsonElement draft)
@@ -380,7 +418,11 @@ internal sealed class GitHubUpdateService : IDisposable
             }
         }
 
-        return packageUri == null ? null : new ReleaseInfo(tag, version, packageUri);
+        string notes = root.TryGetProperty("body", out JsonElement body)
+            && body.ValueKind == JsonValueKind.String
+            ? body.GetString() ?? ""
+            : "";
+        return packageUri == null ? null : new ReleaseInfo(tag, version, packageUri, notes);
     }
 
     private static async Task ExtractPackageAsync(
@@ -667,7 +709,7 @@ internal sealed class GitHubUpdateService : IDisposable
         }
     }
 
-    private sealed record ReleaseInfo(string Tag, string Version, Uri DownloadUrl);
+    private sealed record ReleaseInfo(string Tag, string Version, Uri DownloadUrl, string Notes);
 
     private readonly record struct InstalledFile(
         string Staged,
@@ -688,3 +730,13 @@ internal sealed class GitHubUpdateService : IDisposable
         Failed,
     }
 }
+
+internal readonly record struct ReplayUpdateSnapshot(
+    bool Checking,
+    bool Downloading,
+    bool HasUpdate,
+    bool ReadyToRestart,
+    bool Failed,
+    string Status,
+    string Version,
+    string Notes);

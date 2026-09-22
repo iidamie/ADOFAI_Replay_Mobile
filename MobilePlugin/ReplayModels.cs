@@ -4,7 +4,10 @@ namespace Replay.Mobile;
 
 public sealed class ReplayData
 {
-    public int FormatVersion { get; set; } = 2;
+    // Version 3 adds the play-time difficulty (0 = Lenient, 1 = Normal,
+    // 2 = Strict). The loader still accepts version 1/2 files and treats
+    // files without the field as Normal.
+    public int FormatVersion { get; set; } = 3;
     public string ModVersion { get; set; } = ReplayPlugin.ModVersion;
     public string SessionId { get; set; } = Guid.NewGuid().ToString("N");
     public DateTime RecordedAtUtc { get; set; } = DateTime.UtcNow;
@@ -18,6 +21,7 @@ public sealed class ReplayData
     public bool Completed { get; set; }
     public float Speed { get; set; } = 1f;
     public float Bpm { get; set; }
+    public int Difficulty { get; set; } = 1;
     public int StartTile { get; set; }
     public int EndTile { get; set; }
     public int TotalTiles { get; set; }
@@ -170,6 +174,7 @@ internal sealed record ReplayFileEntry(
     int EndTile,
     int TotalTiles,
     float Speed,
+    int Difficulty,
     bool IsOfficialLevel,
     bool Completed,
     bool NativeFormat,

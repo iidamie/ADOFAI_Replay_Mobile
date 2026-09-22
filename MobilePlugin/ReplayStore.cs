@@ -136,6 +136,7 @@ internal sealed class ReplayStore
                     replay.EndTile,
                     replay.TotalTiles,
                     replay.Speed,
+                    replay.Difficulty,
                     replay.IsOfficialLevel,
                     replay.Completed,
                     nativeFormat,
@@ -157,6 +158,7 @@ internal sealed class ReplayStore
                     0,
                     0,
                     1f,
+                    1,
                     false,
                     false,
                     false,
@@ -201,8 +203,14 @@ internal sealed class ReplayStore
     {
         if (replay == null)
             throw new InvalidDataException("回放数据为空。");
-        if (replay.FormatVersion is not (1 or 2))
+        if (replay.FormatVersion is not (1 or 2 or 3))
             throw new InvalidDataException($"不支持回放格式版本 {replay.FormatVersion}。");
+        // Versions 1/2 did not carry difficulty. Treat them as Normal even
+        // when an old JSON deserializer leaves the new property at zero.
+        if (replay.FormatVersion < 3)
+            replay.Difficulty = 1;
+        else if (replay.Difficulty is < 0 or > 2)
+            throw new InvalidDataException($"回放难度值无效: {replay.Difficulty}。");
         replay.Hits ??= new List<ReplayHit>();
         replay.TouchEvents ??= new List<ReplayTouchInput>();
         replay.KeyboardEvents ??= new List<ReplayKeyboardInput>();
@@ -540,6 +548,8 @@ internal static class Rpl2ReplayCodec
         writer.Write(replayFlags);
         writer.Write(replay.Speed);
         writer.Write(replay.Bpm);
+        if (replay.FormatVersion >= 3)
+            WriteVarInt(writer, replay.Difficulty);
         WriteVarInt(writer, replay.StartTile);
         WriteVarInt(writer, replay.EndTile);
         WriteVarInt(writer, replay.TotalTiles);
@@ -629,6 +639,12 @@ internal static class Rpl2ReplayCodec
         if ((replayFlags & ~3) != 0)
             throw new InvalidDataException("RPL2 回放标志无效。");
 
+        float speed = reader.ReadSingle();
+        float bpm = reader.ReadSingle();
+        int difficulty = formatVersion >= 3
+            ? ReadInt32(reader, "难度")
+            : 1;
+
         ReplayData replay = new()
         {
             FormatVersion = (int)formatVersion,
@@ -643,8 +659,9 @@ internal static class Rpl2ReplayCodec
             LevelId = levelId,
             IsOfficialLevel = (replayFlags & 1) != 0,
             Completed = (replayFlags & 2) != 0,
-            Speed = reader.ReadSingle(),
-            Bpm = reader.ReadSingle(),
+            Speed = speed,
+            Bpm = bpm,
+            Difficulty = difficulty,
             StartTile = ReadInt32(reader, "起始瓦片"),
             EndTile = ReadInt32(reader, "结束瓦片"),
             TotalTiles = ReadInt32(reader, "总瓦片"),
